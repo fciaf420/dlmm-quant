@@ -1,0 +1,10 @@
+{
+  "name": "dlmm-quant",
+  "version": "0.1.0",
+  "description": "Quant LP system for Meteora DLMM: IL-breakeven screener, bin-crowding scorer, surge/flow-gated deploys, A-S inventory-aware management",
+  "license": "MIT",
+  "dependencies": {
+    "@meteora-ag/dlmm": "^1.5.4",
+    "@solana/web3.js": "^1.95.3"
+  }
+}

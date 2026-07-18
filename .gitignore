@@ -1,0 +1,6 @@
+node_modules/
+*.key
+*.b58
+secrets/
+smoke_position.json
+.env
