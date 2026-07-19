@@ -4,6 +4,7 @@ const DLMMImport = require('@meteora-ag/dlmm');
 const DLMM = DLMMImport.default ?? DLMMImport;
 const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
 const BN = require('bn.js');
+const { sendConfirm, confirmSig } = require('./sendtx.cjs');
 const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
 const SOLM = "So11111111111111111111111111111111111111112";
 const arg = (k) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : null; };
@@ -24,7 +25,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avo
     const tx = await dlmm.removeLiquidity({ position: pos.publicKey, user: user.publicKey,
       fromBinId: Math.min(...ids), toBinId: Math.max(...ids), bps: new BN(10000), shouldClaimAndClose: true });
     for (const t of (Array.isArray(tx)?tx:[tx])) {
-      const sig = await sendAndConfirmTransaction(conn, t, [user], { commitment:'confirmed' });
+      const sig = await sendConfirm(conn, t, [user], 'close');
       console.log('close tx:', sig);
     }
   }
@@ -48,7 +49,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avo
         body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
       const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
       const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
-      await conn.confirmTransaction(sig,'confirmed'); console.log('sweep v1:', sig);
+      await confirmSig(conn, sig, 'sweep v1'); console.log('sweep v1:', sig);
     }
   }
   fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg.filter(r=>r.pool!==POOL), null, 1));
