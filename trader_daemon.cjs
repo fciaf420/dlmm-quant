@@ -37,6 +37,19 @@ function ev(msg){
 const log = (m) => { fs.appendFileSync(DIR+'/daemon.log', `${new Date().toISOString()} | ${m}\n`); };
 // One compact stdout line per tick. Detail stays in daemon.log.
 const hb = (m) => { console.log(`${new Date().toTimeString().slice(0,8)} ${m}`); };
+// Scan progress: indented, goes to both stdout and daemon.log so the terminal
+// shows what's being evaluated instead of sitting silent for ~15s.
+const sc = (m) => { console.log(`         ${m}`); log(m); };
+// First gate a candidate fails, so a rejection is legible at a glance.
+function blocker(edge, sg, ac, org, path, ageH, ofi){
+  if (path === 'FREEFALL') return 'FREEFALL';
+  if (edge < 1.0)  return `edge ${edge.toFixed(2)}<1.0`;
+  if (sg   < 1.25) return `surge ${sg.toFixed(2)}<1.25`;
+  if (ac   < 1.2)  return `accel ${ac.toFixed(2)}<1.2`;
+  if (org  < 40)   return `org ${org.toFixed(0)}<40`;
+  if (!(ageH >= 6 || (org >= 60 && ofi < 2))) return `age ${ageH.toFixed(1)}h<6`;
+  return 'no fit';
+}
 async function jget(u, jup){ const r = await fetch(u, jup?{headers:{'x-api-key':JK}}:undefined); if(!r.ok) throw new Error(`${r.status} ${u.slice(0,60)}`); return r.json(); }
 
 async function manage(){
@@ -91,9 +104,15 @@ async function scan(){
   B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
   B.sort((a,b)=>b._fr-a._fr);
   let best = null;
-  for (const p of B.slice(0,8)) {
-    if (positions.find(r=>r.pool===p.address)) continue;
-    if (s.cooldowns[p.address] && Date.now()-s.cooldowns[p.address] < 2*3600e3) continue;
+  const cands = B.slice(0,8);
+  hb(`scanning: ${(bd.data||bd).length} pools -> ${B.length} pass tvl/vol -> checking top ${cands.length} by fee rate`);
+  for (const [i, p] of cands.entries()) {
+    const n = `${i+1}/${cands.length} ${(p.name||'?').padEnd(16).slice(0,16)}`;
+    if (positions.find(r=>r.pool===p.address)) { sc(`${n} skip: already holding`); continue; }
+    if (s.cooldowns[p.address] && Date.now()-s.cooldowns[p.address] < 2*3600e3) {
+      const mins = Math.round((2*3600e3 - (Date.now()-s.cooldowns[p.address]))/60e3);
+      sc(`${n} skip: cooldown ${mins}m left`); continue;
+    }
     try {
       const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${p.token_x.address}`, true);
       const t = Array.isArray(tk)?tk[0]:null; if(!t) continue;
@@ -122,7 +141,7 @@ async function scan(){
         sig = { label:'BASING', mode:'two', widthPct:18, size:0.3, tp:20, sl:-15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
         sig = { label:'CARRY', mode:'two', widthPct:35, size:0.4, tp:15, sl:-12, stop:0 };
-      log(`scan ${p.name} edge=${edge.toFixed(2)} sg=${p._sg.toFixed(2)} ac=${p._ac.toFixed(2)} ofi=${ofi.toFixed(2)}/${ofi6.toFixed(2)} org=${org.toFixed(0)} ${path}${sig?' -> '+sig.label:''}`);
+      sc(`${n} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
     } catch(e){ log(`scan err ${p.name}: ${e.message}`); }

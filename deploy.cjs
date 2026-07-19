@@ -33,10 +33,28 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   const pool = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${POOL}`)).json();
   const MINT = pool.token_x.address;
   const binStepPct = pool.pool_config.bin_step / 100;
-  const widthBins = Math.max(3, Math.round(widthPct / binStepPct));
+  // Position sizing. initializePositionAndAddLiquidityByStrategy creates the account via
+  // CPI, so it can only cover DEFAULT_BIN_PER_POSITION (70) bins before the account
+  // outgrows Solana's 10240-byte inner-instruction realloc cap (InvalidRealloc). Wider
+  // ranges use createExtendedEmptyPosition, which grows the account outside that path
+  // and supports up to MAX_BINS_PER_POSITION (1400). Two-sided spans 2w+1 bins, single w+1.
+  const DEF_BINS = DLMMImport.DEFAULT_BIN_PER_POSITION?.toNumber?.() ?? 70;
+  const MAX_BINS = DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400;
+  const maxHalf = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
+  const wanted = Math.max(3, Math.round(widthPct / binStepPct));
+  const widthBins = Math.min(wanted, maxHalf);
+  const effPct = (widthBins * binStepPct).toFixed(1);
+  if (widthBins < wanted) console.log(`width clamped: ±${widthPct}% = ${wanted} bins exceeds the ${MAX_BINS}-bin max -> using ${widthBins} bins (±${effPct}%)`);
+  const totalBins = mode === 'single' ? widthBins + 1 : 2*widthBins + 1;
+  const extended = totalBins > DEF_BINS;
+  // Rent scales with width past the default: POSITION_MIN_SIZE + 112B per extra bin.
+  // Refunded on close, but it locks capital, so charge it to the affordability check.
+  const acctSize = (DLMMImport.POSITION_MIN_SIZE ?? 8112) + Math.max(0, totalBins - DEF_BINS) * (DLMMImport.POSITION_BIN_DATA_SIZE ?? 112);
+  const rent = (await conn.getMinimumBalanceForRentExemption(acctSize)) / 1e9;
   const bal = await conn.getBalance(user.publicKey);
-  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${widthPct}% (${widthBins} bins) tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
-  if (bal/1e9 < size + 0.12) { console.error('INSUFFICIENT: need', size+0.12); process.exit(2); }
+  const need = size + rent + 0.08; // + bin array init and gas headroom
+  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${effPct}% (${totalBins} bins${extended?', extended':''}) rent ${rent.toFixed(4)} tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
+  if (bal/1e9 < need) { console.error(`INSUFFICIENT: need ${need.toFixed(4)} SOL (${size} position + ${rent.toFixed(4)} rent + 0.08 fees), have ${(bal/1e9).toFixed(4)}`); process.exit(2); }
   if (DRY) { console.log('DRY RUN OK'); return; }
   let totalX = new BN(0);
   let swapSOL = mode === 'two' ? size/2 : 0;
@@ -80,14 +98,34 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   const minBinId = mode === 'single' ? active.binId - widthBins : active.binId - widthBins;
   const maxBinId = mode === 'single' ? active.binId : active.binId + widthBins;
   const posKp = Keypair.generate();
-  const tx = await dlmm.initializePositionAndAddLiquidityByStrategy({
-    positionPubKey: posKp.publicKey, user: user.publicKey,
-    totalXAmount: totalX, totalYAmount: new BN(Math.floor(solSide*1e9)),
-    strategy: { minBinId, maxBinId, strategyType: StrategyType.Spot },
-  });
-  for (const t of (Array.isArray(tx)?tx:[tx])) {
-    const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
-    console.log('open tx:', sig);
+  const strategy = { minBinId, maxBinId, strategyType: StrategyType.Spot };
+  const totalYAmount = new BN(Math.floor(solSide*1e9));
+  if (!extended) {
+    const tx = await dlmm.initializePositionAndAddLiquidityByStrategy({
+      positionPubKey: posKp.publicKey, user: user.publicKey,
+      totalXAmount: totalX, totalYAmount, strategy,
+    });
+    for (const t of (Array.isArray(tx)?tx:[tx])) {
+      const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
+      console.log('open tx:', sig);
+    }
+  } else {
+    // Two steps: create the wide account first, then fund it. If the add leg fails the
+    // position exists but sits empty — it still gets registered below so exit.cjs can
+    // reclaim the rent.
+    const initTx = await dlmm.createExtendedEmptyPosition(minBinId, maxBinId, posKp.publicKey, user.publicKey);
+    for (const t of (Array.isArray(initTx)?initTx:[initTx])) {
+      const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
+      console.log('extended position tx:', sig);
+    }
+    const addTx = await dlmm.addLiquidityByStrategy({
+      positionPubKey: posKp.publicKey, user: user.publicKey,
+      totalXAmount: totalX, totalYAmount, strategy, slippage: 3,
+    });
+    for (const t of (Array.isArray(addTx)?addTx:[addTx])) {
+      const sig = await sendAndConfirmTransaction(conn, t, [user], { commitment:'confirmed' });
+      console.log('add liquidity tx:', sig);
+    }
   }
   const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
   reg.push({ pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
