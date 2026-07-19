@@ -7,6 +7,8 @@ const BN = require('bn.js');
 const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
 const SOLM = "So11111111111111111111111111111111111111112";
 const arg = (k) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : null; };
+// Same reasoning as deploy.cjs: never abandon a half-finished withdrawal.
+process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avoid a half-closed position'));
 (async () => {
   const POOL = arg('pool');
   const rpc = RPC_URL;

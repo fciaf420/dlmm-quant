@@ -7,7 +7,24 @@ const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
 const TICK_MS = 120e3, SCAN_EVERY = 7; // scan every 7th tick (~14 min)
 const NODE = process.execPath;
+const HEARTBEAT = DIR + '/daemon.heartbeat';
 let tick = 0;
+// --- graceful shutdown ---
+// Ctrl-C sets a flag rather than killing outright. Deploy/exit children run under
+// execFileSync, which blocks the event loop, so the handler can only fire between
+// steps — an in-flight transaction always finishes first. Second Ctrl-C forces out.
+let stopping = false, wake = null;
+const sleep = (ms) => new Promise(r => { wake = r; setTimeout(r, ms); });
+function shutdown(sig){
+  if (stopping) { console.log(`\n${sig} again - forcing exit`); process.exit(1); }
+  stopping = true;
+  console.log(`\n${sig} - finishing current step, then exiting (Ctrl-C again to force)`);
+  if (wake) wake();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Clear the heartbeat so the next start isn't blocked by the 3-minute liveness guard.
+process.on('exit', () => { try { fs.rmSync(HEARTBEAT, { force: true }); } catch(e){} });
 const st = () => fs.existsSync(DIR+'/daemon_state.json') ? JSON.parse(fs.readFileSync(DIR+'/daemon_state.json','utf8')) : { lastFeeRates:{}, cooldowns:{}, alerted:{} };
 const saveSt = (s) => fs.writeFileSync(DIR+'/daemon_state.json', JSON.stringify(s,null,1));
 const reg = () => fs.existsSync(DIR+'/positions.json') ? JSON.parse(fs.readFileSync(DIR+'/positions.json','utf8')) : [];
@@ -18,11 +35,13 @@ function ev(msg){
   console.log(line);
 }
 const log = (m) => { fs.appendFileSync(DIR+'/daemon.log', `${new Date().toISOString()} | ${m}\n`); };
+// One compact stdout line per tick. Detail stays in daemon.log.
+const hb = (m) => { console.log(`${new Date().toTimeString().slice(0,8)} ${m}`); };
 async function jget(u, jup){ const r = await fetch(u, jup?{headers:{'x-api-key':JK}}:undefined); if(!r.ok) throw new Error(`${r.status} ${u.slice(0,60)}`); return r.json(); }
 
 async function manage(){
-  const positions = reg(); if(!positions.length) return;
-  const s = st();
+  const positions = reg(); if(!positions.length) return [];
+  const s = st(); const held = [];
   for (const p of positions) {
     try {
       const pnl = await jget(`${MET}/positions/${p.pool}/pnl?user=${WALLET}&status=open`);
@@ -54,15 +73,19 @@ async function manage(){
           s.cooldowns[p.pool] = Date.now();
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
         } catch(e){ ev(`EXIT FAILED ${p.name}: ${String(e.message).slice(0,120)} — will retry next tick`); }
-      } else log(`hold ${p.name} pnl=${pnlPct.toFixed(2)}% fee=${feeRate.toFixed(1)} ofi=${ofi.toFixed(2)}`);
-    } catch(e){ log(`manage err ${p.name}: ${e.message}`); }
+      } else {
+        log(`hold ${p.name} pnl=${pnlPct.toFixed(2)}% fee=${feeRate.toFixed(1)} ofi=${ofi.toFixed(2)}`);
+        held.push(`${p.name} ${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%/f${feeRate.toFixed(0)}`);
+      }
+    } catch(e){ log(`manage err ${p.name}: ${e.message}`); held.push(`${p.name} ERR`); }
   }
   saveSt(s);
+  return held;
 }
 
 async function scan(){
-  const s = st(); const positions = reg();
-  if (positions.length >= 2) { log('scan skipped: 2 positions open'); return; }
+  const s = st(); const positions = reg(); let seen = 0;
+  if (positions.length >= 2) { log('scan skipped: 2 positions open'); return 'scan skipped (2 open)'; }
   const bd = await jget(`${MET}/pools?sort_by=volume_24h:desc&page_size=100`);
   const B = (bd.data||bd).filter(p=>(p.tvl||0)>=60000 && (p.volume?.["24h"]||0)>=150000);
   B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
@@ -74,6 +97,7 @@ async function scan(){
     try {
       const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${p.token_x.address}`, true);
       const t = Array.isArray(tk)?tk[0]:null; if(!t) continue;
+      seen++;
       const ageH = t.createdAt ? (Date.now()-new Date(t.createdAt).getTime())/3600e3 : 999;
       const pc5=t.stats5m?.priceChange||0, pc1=t.stats1h?.priceChange||0, pc24=t.stats24h?.priceChange||0;
       const sigma = ageH>=24 ? Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, Math.abs(pc24)) : Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, 60);
@@ -113,6 +137,7 @@ async function scan(){
     } catch(e){ ev(`DEPLOY FAILED ${p.name}: ${String(e.message).slice(0,150)}`); }
   }
   saveSt(s);
+  return best ? `scanned ${seen} -> ${best.sig.label} ${best.p.name}` : `scanned ${seen}, no signal`;
 }
 
 (function cleanStaleLock(){
@@ -120,11 +145,11 @@ async function scan(){
   try { if (fs.existsSync(L) && Date.now()-fs.statSync(L).mtimeMs > 10*60e3) fs.rmSync(L,{recursive:true,force:true}); } catch(e){}
 })();
 (async function guard(){
-  const LOCK = DIR + '/daemon.heartbeat';
-  if (fs.existsSync(DIR+'/STOP')) { console.log('STOP file present - exiting'); process.exit(0); }
-  if (fs.existsSync(LOCK) && Date.now() - fs.statSync(LOCK).mtimeMs < 3*60e3) { console.log('another live daemon holds heartbeat - exiting'); process.exit(0); }
-  setInterval(() => { try { fs.writeFileSync(LOCK, String(process.pid)); } catch(e){} }, 60e3);
-  try { fs.writeFileSync(LOCK, String(process.pid)); } catch(e){}
+  if (fs.existsSync(DIR+'/STOP')) { console.log('STOP file present - rm STOP to start again'); process.exit(0); }
+  if (fs.existsSync(HEARTBEAT) && Date.now() - fs.statSync(HEARTBEAT).mtimeMs < 3*60e3) { console.log('another live daemon holds heartbeat - exiting'); process.exit(0); }
+  const hbTimer = setInterval(() => { try { fs.writeFileSync(HEARTBEAT, String(process.pid)); } catch(e){} }, 60e3);
+  hbTimer.unref();
+  try { fs.writeFileSync(HEARTBEAT, String(process.pid)); } catch(e){}
 })();
 
 (async function loop(){
@@ -132,9 +157,17 @@ async function scan(){
   ev('Trader daemon ONLINE (launchd, lock-immune)');
   while (true) {
     if (fs.existsSync(DIR+'/STOP')) { ev('STOP file - daemon shutting down'); process.exit(0); }
-    try { await manage(); } catch(e){ log('manage fatal '+e.message); }
-    if (tick % SCAN_EVERY === 0) { try { await scan(); } catch(e){ log('scan fatal '+e.message); } }
+    if (stopping) break;
+    let held = [], scanned = null;
+    try { held = await manage(); } catch(e){ log('manage fatal '+e.message); held = ['manage ERR']; }
+    if (stopping) break;
+    if (tick % SCAN_EVERY === 0) { try { scanned = await scan(); } catch(e){ log('scan fatal '+e.message); scanned = 'scan ERR'; } }
+    hb([`t${tick}`, held.length ? held.join(' | ') : 'no positions', scanned].filter(Boolean).join(' | '));
     tick++;
-    await new Promise(r=>setTimeout(r, TICK_MS));
+    if (stopping) break;
+    await sleep(TICK_MS);
   }
+  const open = reg();
+  ev(`daemon STOPPED cleanly${open.length ? ` — ${open.length} position(s) still open and now UNMANAGED: ${open.map(p=>p.name).join(', ')}` : ''}`);
+  process.exit(0);
 })();
