@@ -3,6 +3,7 @@
 const fs = require('fs');
 const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
 const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
+const { confirmSig } = require('./sendtx.cjs');
 (async () => {
   const [inMint, outMint, amount] = process.argv.slice(2);
   const rpc = RPC_URL;
@@ -27,7 +28,7 @@ const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
     const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64'));
     tx.sign([user]);
     const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
-    await conn.confirmTransaction(sig,'confirmed');
+    await confirmSig(conn, sig, 'swap');
     console.log('v1 fallback:', sig);
   }
 })().catch(e => { console.error('ERR', e.message); process.exit(1); });

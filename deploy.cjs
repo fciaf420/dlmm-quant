@@ -5,6 +5,7 @@ const DLMM = DLMMImport.default ?? DLMMImport;
 const { StrategyType } = DLMMImport;
 const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
 const BN = require('bn.js');
+const { sendConfirm, confirmSig } = require('./sendtx.cjs');
 const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
 const SOLM = "So11111111111111111111111111111111111111112";
 const arg = (k, d) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : d; };
@@ -84,7 +85,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
         body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
       const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
       const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
-      await conn.confirmTransaction(sig,'confirmed'); console.log('swap v1:', sig);
+      await confirmSig(conn, sig, 'swap v1'); console.log('swap v1:', sig);
     }
     await new Promise(r=>setTimeout(r,2000));
     const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
@@ -106,7 +107,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       totalXAmount: totalX, totalYAmount, strategy,
     });
     for (const t of (Array.isArray(tx)?tx:[tx])) {
-      const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
+      const sig = await sendConfirm(conn, t, [user, posKp], 'position');
       console.log('open tx:', sig);
     }
   } else {
@@ -115,7 +116,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     // reclaim the rent.
     const initTx = await dlmm.createExtendedEmptyPosition(minBinId, maxBinId, posKp.publicKey, user.publicKey);
     for (const t of (Array.isArray(initTx)?initTx:[initTx])) {
-      const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
+      const sig = await sendConfirm(conn, t, [user, posKp], 'position');
       console.log('extended position tx:', sig);
     }
     const addTx = await dlmm.addLiquidityByStrategy({
@@ -123,7 +124,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       totalXAmount: totalX, totalYAmount, strategy, slippage: 3,
     });
     for (const t of (Array.isArray(addTx)?addTx:[addTx])) {
-      const sig = await sendAndConfirmTransaction(conn, t, [user], { commitment:'confirmed' });
+      const sig = await sendConfirm(conn, t, [user], 'liquidity');
       console.log('add liquidity tx:', sig);
     }
   }
