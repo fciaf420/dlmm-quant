@@ -1,0 +1,94 @@
+// Generic deploy: node deploy.cjs --pool X --size 0.3 --mode two|single --widthPct 18 --tp 20 --sl -15 --stopPrice 0 --label BASING [--dry]
+const fs = require('fs');
+const DLMMImport = require('@meteora-ag/dlmm');
+const DLMM = DLMMImport.default ?? DLMMImport;
+const { StrategyType } = DLMMImport;
+const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
+const BN = require('bn.js');
+const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
+const SOLM = "So11111111111111111111111111111111111111112";
+const arg = (k, d) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : d; };
+const DRY = process.argv.includes('--dry');
+(async () => {
+  const POOL = arg('pool'), size = +arg('size','0.3'), mode = arg('mode','two'), widthPct = +arg('widthPct','18');
+  const tp = +arg('tp','20'), sl = +arg('sl','-15'), stopPrice = +arg('stopPrice','0'), label = arg('label','POS');
+  const rpc = RPC_URL;
+  const user = keypair();
+  const conn = new Connection(rpc, 'confirmed');
+  // ---- ZOMBIE-PROOF GUARDS (atomic lock + dedup + cap) ----
+  const lockDir = __dirname + '/.deploy.lock';
+  try { fs.mkdirSync(lockDir); } catch(e) {
+    const age = Date.now() - fs.statSync(lockDir).mtimeMs;
+    if (age < 5*60e3) { console.error('LOCKED: another deploy in progress'); process.exit(3); }
+    fs.rmSync(lockDir, { recursive: true, force: true }); fs.mkdirSync(lockDir);
+  }
+  process.on('exit', () => { try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch(e){} });
+  const reg0 = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
+  if (reg0.find(r => r.pool === POOL)) { console.error('DUPLICATE: position already exists for this pool'); process.exit(4); }
+  if (reg0.length >= 2) { console.error('CAP: 2 positions already open'); process.exit(5); }
+  const pool = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${POOL}`)).json();
+  const MINT = pool.token_x.address;
+  const binStepPct = pool.pool_config.bin_step / 100;
+  const widthBins = Math.max(3, Math.round(widthPct / binStepPct));
+  const bal = await conn.getBalance(user.publicKey);
+  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${widthPct}% (${widthBins} bins) tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
+  if (bal/1e9 < size + 0.12) { console.error('INSUFFICIENT: need', size+0.12); process.exit(2); }
+  if (DRY) { console.log('DRY RUN OK'); return; }
+  let totalX = new BN(0);
+  let swapSOL = mode === 'two' ? size/2 : 0;
+  // idempotency: if a prior timed-out attempt already swapped, reuse the held tokens
+  try {
+    const pre = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
+    const preRaw = pre.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
+    const preUi = pre.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.uiAmount), 0);
+    const preVal = preUi * (pool.current_price||0);
+    if (preVal > swapSOL * 0.5) { console.log('reusing held tokens from prior attempt:', preRaw); swapSOL = 0; totalX = new BN(String(preRaw)); }
+  } catch(e){}
+  if (swapSOL > 0) {
+    const amt = Math.floor(swapSOL*1e9);
+    let ok = false;
+    try {
+      const ord = await (await fetch(`https://api.jup.ag/swap/v2/order?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&taker=${user.publicKey.toBase58()}`, { headers:{'x-api-key':JK} })).json();
+      if (ord.transaction) {
+        const tx = VersionedTransaction.deserialize(Buffer.from(ord.transaction,'base64')); tx.sign([user]);
+        const ex = await (await fetch('https://api.jup.ag/swap/v2/execute', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
+          body: JSON.stringify({ signedTransaction: Buffer.from(tx.serialize()).toString('base64'), requestId: ord.requestId }) })).json();
+        ok = ex.status === 'Success'; console.log('swap v2:', ex.status, ex.signature||'');
+      }
+    } catch(e){ console.log('v2 err', e.message); }
+    if (!ok) {
+      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&slippageBps=300`, { headers:{'x-api-key':JK} })).json();
+      const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
+        body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
+      const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
+      const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
+      await conn.confirmTransaction(sig,'confirmed'); console.log('swap v1:', sig);
+    }
+    await new Promise(r=>setTimeout(r,2000));
+    const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
+    const raw = accs.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
+    totalX = new BN(String(raw));
+    console.log('token acquired (raw):', raw);
+  }
+  const solSide = mode === 'two' ? size/2 : size;
+  const dlmm = await DLMM.create(conn, new PublicKey(POOL));
+  const active = await dlmm.getActiveBin();
+  const minBinId = mode === 'single' ? active.binId - widthBins : active.binId - widthBins;
+  const maxBinId = mode === 'single' ? active.binId : active.binId + widthBins;
+  const posKp = Keypair.generate();
+  const tx = await dlmm.initializePositionAndAddLiquidityByStrategy({
+    positionPubKey: posKp.publicKey, user: user.publicKey,
+    totalXAmount: totalX, totalYAmount: new BN(Math.floor(solSide*1e9)),
+    strategy: { minBinId, maxBinId, strategyType: StrategyType.Spot },
+  });
+  for (const t of (Array.isArray(tx)?tx:[tx])) {
+    const sig = await sendAndConfirmTransaction(conn, t, [user, posKp], { commitment:'confirmed' });
+    console.log('open tx:', sig);
+  }
+  const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
+  reg.push({ pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
+    sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
+    tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, openedAt: new Date().toISOString() });
+  fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg, null, 1));
+  console.log('DEPLOYED:', posKp.publicKey.toBase58(), `bins ${minBinId}..${maxBinId}`, '| registry updated');
+})().catch(e => { console.error('ERR', e.message); process.exit(1); });

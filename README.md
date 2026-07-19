@@ -1,51 +1,71 @@
 # dlmm-quant
 
-A quant LP system for [Meteora DLMM](https://meteora.ag) on Solana. Treats an LP position as a payoff shape and a market-making book, not a "set a range and pray" deposit.
+Autonomous quant LP trading daemon for [Meteora DLMM](https://meteora.ag) on Solana. Scans the pool board, deploys liquidity when the math clears, manages positions against data-driven brackets, exits fully to SOL. No UI, no babysitting — one process.
 
-## The four strategies
-
-1. **Bin-crowding arbitrage (queue positioning)** — fee share in a bin = your liquidity ÷ bin total. `binscore.cjs` maps every LP's liquidity bin-by-bin on-chain, scores bins by traversal-probability ÷ crowding, and deploys into the thin high-traffic bins other LPs leave empty (retail all cluster in the default centered spread).
-2. **Volatility-accumulator surge timing** — DLMM's dynamic fee is a readable state variable. Only deploy when the vol accumulator is surged (`dynamic_fee / base_fee ≥ 1.25`) and volume is accelerating; exit when it decays. Sell insurance only when the premium is elevated.
-3. **Fee term-structure roll-down** — pool fee run-rates decay ~exponentially after ignition. The scanner fits per-pool half-lives from its own scan history; positions exit at a fixed fraction of decay (fee rate < 25% of entry), not at a price target.
-4. **Inventory-aware skew (Avellaneda-Stoikov on bins)** — re-centers are never blind-symmetric: range = `[-W×(1-inv), +W×inv]` where `inv` = fraction of position value in the base token, and width `W = clamp(realizedVol/4, 12%, 30%)`.
-
-## Entry bar: IL-breakeven, not vibes
-
-For a Spot range of half-width `W`, expected IL/day ≈ `σ²/8W`. A pool is only enterable when
-
-```
-edge = LP_Sharpe / (1.3 × σ/(8W)) ≥ 1.0     where LP_Sharpe = netFeeRate / σ
-```
-
-i.e. fees must clear expected IL with a 30% margin. The bar breathes with each pool's volatility — a 200%/day memecoin needs ~3x the fee yield a 60%/day pool does.
-
-## Signals (all from public APIs)
-
-- **Meteora Data API** (`dlmm.datapi.meteora.ag`): fee/TVL by window, dynamic fee (surge), volume acceleration
-- **Jupiter Tokens API**: Organic Score (wash-trade filter), organic buy/sell flow imbalance (OFI), multi-window realized vol, mint/freeze authority audit
-- **On-chain via `@meteora-ag/dlmm`**: bin-level liquidity distribution, exact-bin position placement
-
-## Files
-
-- `binscore.cjs` — bin-gap scorer: `node binscore.cjs <pool> <realizedVolPctPerDay>`
-- `bins.cjs` — raw bin-distribution reader
-- `PLAYBOOK.md` — the full operating spec: scan → deploy → manage → learn, dynamic TP/SL bracket math, carry vs scalp sleeves, capital allocation
-
-## Dynamic brackets (no flat ±20%)
-
-```
-TP = clamp( max(0.6 × netFeeRate × t½/ln2, 1.2 × σ × √hold), 10, 40 )
-SL = -clamp( σ × √hold, 10, 25 )
-```
-
-## Setup
+## Quick start
 
 ```bash
+git clone https://github.com/fciaf420/dlmm-quant && cd dlmm-quant
 npm install
-# keypair JSON (Uint8Array bytes) + RPC URL supplied via your own config — never commit them
-node binscore.cjs <POOL_ADDRESS> <VOL_PCT_PER_DAY>
+cp .env.example .env     # fill in RPC_URL, KEYPAIR_PATH (or PRIVATE_KEY), JUP_API_KEY
+npm start                # runs the daemon: manage every 2 min, scan+deploy every ~14 min
+```
+
+Use a **dedicated wallet with capped funds**. The daemon's max exposure = the wallet's balance; it refuses deploys below a 0.12 SOL gas/rent buffer.
+
+## What the daemon does
+
+Every 2 minutes (**manage**): for each open position (tracked in `positions.json`) it checks
+TP / price-stop / SL / fee-decay (rate < 50% of entry, 2 reads) / organic flow-flip — any hit closes the position 100% back to SOL via the Meteora SDK + Jupiter Swap v2.
+
+Every ~14 minutes (**scan**): pulls the liquid pool board and computes per pool:
+
+- `feeRate` — live fee/TVL run-rate (%/day)
+- `sigma` — age-aware realized vol (5m/1h/24h √t-scaled; since-launch excluded for tokens < 24h)
+- `edge` — feeRate·0.9/σ divided by the **IL-breakeven bar** `1.3·σ/(8W)` — entries require fees to clear expected IL with margin
+- `surge` — dynamic-fee accumulator vs base (is the vol premium elevated?)
+- `accel` — 30m vs 4h volume run-rate (igniting or fading?)
+- `OFI` — organic sell/buy imbalance from Jupiter (don't be someone's exit liquidity)
+- `path` — FREEFALL / BASING / BLOWOFF / GRIND-UP / CHOP from OHLCV
+
+Three entry classes, each with its own brackets:
+
+| Class | Trigger sketch | Shape |
+|---|---|---|
+| **IGNITION** | edge ≥ 1 + surge ≥ 1.25 + accel ≥ 1.2, never into FREEFALL | vol-scaled width, dynamic TP/SL |
+| **BASING** | −40%+ from high, 5m flattened, organic buying, fees ≥ 15%/day | ±18%, stop below base low |
+| **CARRY** | edge ≥ 1.3, 6h organic buying, mature token, authorities dead (tiered fee floor: 2 / 1.2 / 0.6 %/day as edge quality rises) | ±35%, ride until fee decay |
+
+Safety rails: atomic deploy lock, one-position-per-pool, max 2 concurrent, 2h re-entry cooldown, single-instance heartbeat lock, `STOP` file for graceful shutdown, idempotent deploys (a timed-out deploy resumes from the swapped tokens on retry).
+
+## CLI tools
+
+```bash
+npm run screen                          # one-shot board scan with all signals + verdicts
+node binscore.cjs <POOL> <VOL%/day>     # bin-crowding map: where other LPs aren't
+node deploy.cjs --pool <P> --size 0.3 --mode two --widthPct 18 --tp 20 --sl -15 --label MANUAL
+node exit.cjs --pool <P>                # close everything in pool, sweep to SOL
+node jupswap.cjs <inMint> <outMint> <rawAmount>
+touch STOP                              # graceful daemon shutdown (removes itself on restart)
+```
+
+## Files the daemon writes
+
+- `positions.json` — open-position registry (survives restarts)
+- `daemon_state.json` — fee-rate history, cooldowns
+- `events.log` — deploys/exits/failures (also macOS notifications)
+- `daemon.log` — heartbeat + scan verdicts
+
+## Keeping it alive 24/7
+
+macOS sleep kills any process. Either `caffeinate -s` while on AC, or install the included launchd template:
+
+```bash
+# edit paths in launchd.plist.example, then:
+cp launchd.plist.example ~/Library/LaunchAgents/com.dlmm.quant-trader.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dlmm.quant-trader.plist
 ```
 
 ## Disclaimer
 
-Real-money experimental software. Memecoin LPing can lose everything. Nothing here is financial advice.
+Experimental real-money software for volatile memecoin LPing. You can lose everything. Not financial advice.

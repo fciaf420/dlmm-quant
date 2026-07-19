@@ -1,10 +1,20 @@
 {
   "name": "dlmm-quant",
-  "version": "0.1.0",
-  "description": "Quant LP system for Meteora DLMM: IL-breakeven screener, bin-crowding scorer, surge/flow-gated deploys, A-S inventory-aware management",
+  "version": "0.2.0",
+  "description": "Autonomous quant LP trading daemon for Meteora DLMM: IL-breakeven screener, organic-flow gates, path labels, auto deploy/manage/exit",
   "license": "MIT",
+  "scripts": {
+    "start": "node trader_daemon.cjs",
+    "screen": "node screen.cjs",
+    "deploy": "node deploy.cjs",
+    "exit": "node exit.cjs",
+    "bins": "node binscore.cjs",
+    "swap": "node jupswap.cjs"
+  },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.5.4",
-    "@solana/web3.js": "^1.95.3"
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^6.0.0",
+    "bn.js": "^5.2.1"
   }
 }

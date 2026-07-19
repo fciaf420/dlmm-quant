@@ -1,8 +1,9 @@
+const { RPC_URL, JUP_KEY: JK, keypair } = require('./config.cjs');
 const DLMMImport = require('@meteora-ag/dlmm');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const DLMM = DLMMImport.default ?? DLMMImport;
 (async () => {
-  const conn = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+  const conn = new Connection(RPC_URL, 'confirmed');
   const pool = new PublicKey('2VHM9pTZEU6pqeZoiNi8ZCeyerqhRYgS5Um7U8AEKrd9');
   const dlmm = await DLMM.create(conn, pool);
   const active = await dlmm.getActiveBin();

@@ -4,3 +4,16 @@ node_modules/
 secrets/
 smoke_position.json
 .env
+.env
+positions.json
+daemon_state.json
+daemon.log
+daemon.out
+daemon.err
+daemon.pid
+daemon.heartbeat
+events.log
+basing_meta.json
+smoke_*.json
+.deploy.lock/
+STOP

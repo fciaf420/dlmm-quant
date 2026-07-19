@@ -1,3 +1,4 @@
+const { RPC_URL, JUP_KEY: JK, keypair } = require('./config.cjs');
 // Bin-gap scorer: score = P(traversal) / crowding
 // usage: node binscore.cjs <poolAddress> <dailyVolPct> [side: both|up|down]
 const DLMMImport = require('@meteora-ag/dlmm');
@@ -6,7 +7,7 @@ const DLMM = DLMMImport.default ?? DLMMImport;
 (async () => {
   const [pool, dailyVolPctArg] = process.argv.slice(2);
   const dailyVolPct = Number(dailyVolPctArg || 50);       // realized vol %/day from Jupiter stats
-  const conn = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+  const conn = new Connection(RPC_URL, 'confirmed');
   const dlmm = await DLMM.create(conn, new PublicKey(pool));
   const binStepPct = dlmm.lbPair.binStep / 100;           // % per bin
   const active = await dlmm.getActiveBin();
