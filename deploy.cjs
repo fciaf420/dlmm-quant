@@ -33,9 +33,17 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   const pool = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${POOL}`)).json();
   const MINT = pool.token_x.address;
   const binStepPct = pool.pool_config.bin_step / 100;
-  const widthBins = Math.max(3, Math.round(widthPct / binStepPct));
+  // A position account holds at most DEFAULT_BIN_PER_POSITION (70) bins; past that the
+  // account outgrows Solana's 10240-byte inner-instruction realloc cap and
+  // InitializePosition fails with InvalidRealloc. Two-sided spans 2w+1 bins, single w+1.
+  const MAX_BINS = (DLMMImport.DEFAULT_BIN_PER_POSITION?.toNumber?.() ?? 70);
+  const maxHalf = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
+  const wanted = Math.max(3, Math.round(widthPct / binStepPct));
+  const widthBins = Math.min(wanted, maxHalf);
+  const effPct = (widthBins * binStepPct).toFixed(1);
+  if (widthBins < wanted) console.log(`width clamped: ±${widthPct}% = ${wanted} bins exceeds ${MAX_BINS}-bin position limit at ${binStepPct}% bin step -> using ${widthBins} bins (±${effPct}%)`);
   const bal = await conn.getBalance(user.publicKey);
-  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${widthPct}% (${widthBins} bins) tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
+  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${effPct}% (${widthBins} bins) tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
   if (bal/1e9 < size + 0.12) { console.error('INSUFFICIENT: need', size+0.12); process.exit(2); }
   if (DRY) { console.log('DRY RUN OK'); return; }
   let totalX = new BN(0);
