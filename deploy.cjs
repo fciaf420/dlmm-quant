@@ -40,7 +40,11 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   // ranges use createExtendedEmptyPosition, which grows the account outside that path
   // and supports up to MAX_BINS_PER_POSITION (1400). Two-sided spans 2w+1 bins, single w+1.
   const DEF_BINS = DLMMImport.DEFAULT_BIN_PER_POSITION?.toNumber?.() ?? 70;
-  const MAX_BINS = DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400;
+  // The account supports MAX_BINS_PER_POSITION (1400), but AddLiquidityByStrategy2 panics
+  // with "memory allocation failed, out of memory" well below that: 351 bins OOMs, 145
+  // funds fine. The exact ceiling between those is unmeasured, so cap conservatively.
+  // Override with --maxBins once a higher value is known to work.
+  const MAX_BINS = Math.min(+arg('maxBins', '140'), DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400);
   const maxHalf = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
   const wanted = Math.max(3, Math.round(widthPct / binStepPct));
   const widthBins = Math.min(wanted, maxHalf);
@@ -111,14 +115,16 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       console.log('open tx:', sig);
     }
   } else {
-    // Two steps: create the wide account first, then fund it. If the add leg fails the
-    // position exists but sits empty — it still gets registered below so exit.cjs can
-    // reclaim the rent.
+    // Two steps: create the wide account, then fund it. The create leg spends rent, so
+    // from the moment it confirms the position must be in the registry — otherwise a
+    // failure on the add leg orphans it and nothing will ever reclaim that rent.
     const initTx = await dlmm.createExtendedEmptyPosition(minBinId, maxBinId, posKp.publicKey, user.publicKey);
     for (const t of (Array.isArray(initTx)?initTx:[initTx])) {
       const sig = await sendConfirm(conn, t, [user, posKp], 'position');
       console.log('extended position tx:', sig);
     }
+    record({ funded: false });
+    console.log('registered unfunded position (rent recoverable if the add leg fails)');
     const addTx = await dlmm.addLiquidityByStrategy({
       positionPubKey: posKp.publicKey, user: user.publicKey,
       totalXAmount: totalX, totalYAmount, strategy, slippage: 3,
@@ -128,10 +134,18 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       console.log('add liquidity tx:', sig);
     }
   }
-  const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
-  reg.push({ pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
-    sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
-    tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, openedAt: new Date().toISOString() });
-  fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg, null, 1));
+  record({ funded: true });
   console.log('DEPLOYED:', posKp.publicKey.toBase58(), `bins ${minBinId}..${maxBinId}`, '| registry updated');
+
+  // Upsert this position into the registry. Called once for the standard path and twice
+  // for the extended path (unfunded right after create, then funded after the add leg).
+  function record({ funded }) {
+    const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
+    const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
+      sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
+      tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded, openedAt: new Date().toISOString() };
+    const i = reg.findIndex(r => r.position === row.position);
+    if (i >= 0) reg[i] = { ...reg[i], ...row }; else reg.push(row);
+    fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg, null, 1));
+  }
 })().catch(e => { console.error('ERR', e.message); process.exit(1); });
