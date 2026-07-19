@@ -7,7 +7,24 @@ const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
 const TICK_MS = 120e3, SCAN_EVERY = 7; // scan every 7th tick (~14 min)
 const NODE = process.execPath;
+const HEARTBEAT = DIR + '/daemon.heartbeat';
 let tick = 0;
+// --- graceful shutdown ---
+// Ctrl-C sets a flag rather than killing outright. Deploy/exit children run under
+// execFileSync, which blocks the event loop, so the handler can only fire between
+// steps — an in-flight transaction always finishes first. Second Ctrl-C forces out.
+let stopping = false, wake = null;
+const sleep = (ms) => new Promise(r => { wake = r; setTimeout(r, ms); });
+function shutdown(sig){
+  if (stopping) { console.log(`\n${sig} again - forcing exit`); process.exit(1); }
+  stopping = true;
+  console.log(`\n${sig} - finishing current step, then exiting (Ctrl-C again to force)`);
+  if (wake) wake();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Clear the heartbeat so the next start isn't blocked by the 3-minute liveness guard.
+process.on('exit', () => { try { fs.rmSync(HEARTBEAT, { force: true }); } catch(e){} });
 const st = () => fs.existsSync(DIR+'/daemon_state.json') ? JSON.parse(fs.readFileSync(DIR+'/daemon_state.json','utf8')) : { lastFeeRates:{}, cooldowns:{}, alerted:{} };
 const saveSt = (s) => fs.writeFileSync(DIR+'/daemon_state.json', JSON.stringify(s,null,1));
 const reg = () => fs.existsSync(DIR+'/positions.json') ? JSON.parse(fs.readFileSync(DIR+'/positions.json','utf8')) : [];
@@ -128,11 +145,11 @@ async function scan(){
   try { if (fs.existsSync(L) && Date.now()-fs.statSync(L).mtimeMs > 10*60e3) fs.rmSync(L,{recursive:true,force:true}); } catch(e){}
 })();
 (async function guard(){
-  const LOCK = DIR + '/daemon.heartbeat';
-  if (fs.existsSync(DIR+'/STOP')) { console.log('STOP file present - exiting'); process.exit(0); }
-  if (fs.existsSync(LOCK) && Date.now() - fs.statSync(LOCK).mtimeMs < 3*60e3) { console.log('another live daemon holds heartbeat - exiting'); process.exit(0); }
-  setInterval(() => { try { fs.writeFileSync(LOCK, String(process.pid)); } catch(e){} }, 60e3);
-  try { fs.writeFileSync(LOCK, String(process.pid)); } catch(e){}
+  if (fs.existsSync(DIR+'/STOP')) { console.log('STOP file present - rm STOP to start again'); process.exit(0); }
+  if (fs.existsSync(HEARTBEAT) && Date.now() - fs.statSync(HEARTBEAT).mtimeMs < 3*60e3) { console.log('another live daemon holds heartbeat - exiting'); process.exit(0); }
+  const hbTimer = setInterval(() => { try { fs.writeFileSync(HEARTBEAT, String(process.pid)); } catch(e){} }, 60e3);
+  hbTimer.unref();
+  try { fs.writeFileSync(HEARTBEAT, String(process.pid)); } catch(e){}
 })();
 
 (async function loop(){
@@ -140,11 +157,17 @@ async function scan(){
   ev('Trader daemon ONLINE (launchd, lock-immune)');
   while (true) {
     if (fs.existsSync(DIR+'/STOP')) { ev('STOP file - daemon shutting down'); process.exit(0); }
+    if (stopping) break;
     let held = [], scanned = null;
     try { held = await manage(); } catch(e){ log('manage fatal '+e.message); held = ['manage ERR']; }
+    if (stopping) break;
     if (tick % SCAN_EVERY === 0) { try { scanned = await scan(); } catch(e){ log('scan fatal '+e.message); scanned = 'scan ERR'; } }
     hb([`t${tick}`, held.length ? held.join(' | ') : 'no positions', scanned].filter(Boolean).join(' | '));
     tick++;
-    await new Promise(r=>setTimeout(r, TICK_MS));
+    if (stopping) break;
+    await sleep(TICK_MS);
   }
+  const open = reg();
+  ev(`daemon STOPPED cleanly${open.length ? ` — ${open.length} position(s) still open and now UNMANAGED: ${open.map(p=>p.name).join(', ')}` : ''}`);
+  process.exit(0);
 })();

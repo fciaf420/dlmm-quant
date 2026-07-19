@@ -9,6 +9,10 @@ const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
 const SOLM = "So11111111111111111111111111111111111111112";
 const arg = (k, d) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : d; };
 const DRY = process.argv.includes('--dry');
+// Ctrl-C in a terminal hits the whole process group. Killing mid-deploy can leave an
+// on-chain position that positions.json never records, so ignore SIGINT and finish.
+// The parent's 480s timeout is the real backstop; kill -9 still works.
+process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to keep the registry consistent'));
 (async () => {
   const POOL = arg('pool'), size = +arg('size','0.3'), mode = arg('mode','two'), widthPct = +arg('widthPct','18');
   const tp = +arg('tp','20'), sl = +arg('sl','-15'), stopPrice = +arg('stopPrice','0'), label = arg('label','POS');
