@@ -125,6 +125,14 @@ async function scan(){
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
       const org = t.organicScore||0;
+      // delta history (foundation for squeeze detection)
+      if (!s.history) s.history = {};
+      { const h = s.history[p.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.address] = h.slice(-40); }
+      let sigmaTrail = null, sigmaRatio = null;
+      { const h = s.history[p.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
+        const spanMin = h.length >= 2 ? (h[h.length-1].ts - h[0].ts) / 60e3 : 0;
+        if (prior.length >= 6 && spanMin >= 45) { const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)]; sigmaRatio = sigma / Math.max(sigmaTrail, 0.001); } }
+
       let dd=null,pos=null,low=null;
       try { const oh = await jget(`${MET}/pools/${p.address}/ohlcv`); const c=(oh.data||oh).slice(-1)[0];
         if(c){ dd=(c.high-c.close)/c.high*100; pos=(c.close-c.low)/Math.max(c.high-c.low,1e-18); low=c.low; } } catch(e){}
@@ -152,16 +160,9 @@ async function scan(){
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: 0.3,
           tp: Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
-      sc(`${n} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
+      sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
-          // delta history (foundation for squeeze detection)
-      if (!s.history) s.history = {};
-      { const h = s.history[p.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.address] = h.slice(-40); }
-      let sigmaTrail = null, sigmaRatio = null;
-      { const h = s.history[p.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
-        const spanMin = h.length >= 2 ? (h[h.length-1].ts - h[0].ts) / 60e3 : 0;
-        if (prior.length >= 6 && spanMin >= 45) { const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)]; sigmaRatio = sigma / Math.max(sigmaTrail, 0.001); } }
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
   }
   if (best) {
