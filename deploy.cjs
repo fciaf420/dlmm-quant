@@ -103,7 +103,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   const minBinId = mode === 'single' ? active.binId - widthBins : active.binId - widthBins;
   const maxBinId = mode === 'single' ? active.binId : active.binId + widthBins;
   const posKp = Keypair.generate();
-  const strategy = { minBinId, maxBinId, strategyType: StrategyType.Spot };
+  const strategy = { minBinId, maxBinId, strategyType: (arg('shape','spot') === 'bidask' ? StrategyType.BidAsk : StrategyType.Spot) };
   const totalYAmount = new BN(Math.floor(solSide*1e9));
   if (!extended) {
     const tx = await dlmm.initializePositionAndAddLiquidityByStrategy({
@@ -143,7 +143,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
     const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
       sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
-      tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded, openedAt: new Date().toISOString() };
+      tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded, openedAt: new Date().toISOString() , shape: arg('shape','spot') };
     const i = reg.findIndex(r => r.position === row.position);
     if (i >= 0) reg[i] = { ...reg[i], ...row }; else reg.push(row);
     fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg, null, 1));

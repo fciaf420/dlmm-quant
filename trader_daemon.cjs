@@ -77,6 +77,7 @@ async function manage(){
       else if (pnlPct <= p.slPct) trigger = `SL (${pnlPct.toFixed(1)}% <= ${p.slPct})`;
       else if (feeRate < 0.5*p.entryFeeRate && (s.lastFeeRates[p.pool]??99) < 0.5*p.entryFeeRate) trigger = `FEE-DECAY (${feeRate.toFixed(1)} < half of ${p.entryFeeRate.toFixed(1)}, x2)`;
       else if (ofi > 3 && pc1 < -15) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
+      else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > 24*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved 24h, pnl ${pnlPct.toFixed(1)}%)`;
       s.lastFeeRates[p.pool] = feeRate;
       if (trigger) {
         ev(`EXIT ${p.label} ${p.name}: ${trigger} | pnl ${pnlPct.toFixed(2)}%`);
@@ -144,17 +145,31 @@ async function scan(){
         sig = { label:'BASING', mode:'two', widthPct:18, size:0.3, tp:20, sl:-15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
         sig = { label:'CARRY', mode:'two', widthPct:35, size:0.4, tp:15, sl:-12, stop:0 };
+      else if (sigmaRatio != null && sigmaRatio <= 0.6 && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
+        // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
+        // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
+        const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
+        sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: 0.3,
+          tp: Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
+      }
       sc(`${n} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
-    } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
+          // delta history (foundation for squeeze detection)
+      if (!s.history) s.history = {};
+      { const h = s.history[p.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.address] = h.slice(-40); }
+      let sigmaTrail = null, sigmaRatio = null;
+      { const h = s.history[p.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
+        const spanMin = h.length >= 2 ? (h[h.length-1].ts - h[0].ts) / 60e3 : 0;
+        if (prior.length >= 6 && spanMin >= 45) { const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)]; sigmaRatio = sigma / Math.max(sigmaTrail, 0.001); } }
+      } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
   }
   if (best) {
     const { p, sig } = best;
     ev(`DEPLOY ${sig.label} ${p.name} size ${sig.size} width ±${sig.widthPct}% tp ${sig.tp} sl ${sig.sl}`);
     try {
       const out = execFileSync(NODE, [DIR+'/deploy.cjs','--pool',p.address,'--size',String(sig.size),'--mode',sig.mode,
-        '--widthPct',String(sig.widthPct),'--tp',String(sig.tp),'--sl',String(sig.sl),'--stopPrice',String(sig.stop),'--label',sig.label], { cwd: DIR, timeout: 480e3 }).toString();
+        '--widthPct',String(sig.widthPct),'--tp',String(sig.tp),'--sl',String(sig.sl),'--stopPrice',String(sig.stop),'--label',sig.label,'--shape',(sig.shape||'spot')], { cwd: DIR, timeout: 480e3 }).toString();
       ev(`DEPLOYED ${sig.label} ${p.name}: ${out.match(/DEPLOYED: (\S+)/)?.[1]||'ok'}`);
     } catch(e){ ev(`DEPLOY FAILED ${p.name}: ${String(e.message).slice(0,150)}`); }
   }
