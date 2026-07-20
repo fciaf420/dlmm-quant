@@ -134,9 +134,12 @@ async function scan(){
       else if (pc1>0) path="GRIND-UP";
       const audit = t.audit||{};
       let sig = null;
-      if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2)))
-        sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Math.min(30,Math.max(12,Math.round(sigma/4))), size: edge>=2?0.4:0.3,
-          tp: Math.min(40,Math.max(10,Math.round(Math.max(0.3*p._fr, 0.84*sigma)))), sl: -Math.min(25,Math.max(10,Math.round(sigma*0.7))), stop: 0 };
+      if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2))) {
+        const Wp = Math.min(30,Math.max(12,Math.round(sigma/4)));
+        // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
+        sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?0.4:0.3,
+          tp: Math.min(25,Math.max(8,Math.round(Wp/4 + p._fr*0.5))), sl: -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
+      }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5)
         sig = { label:'BASING', mode:'two', widthPct:18, size:0.3, tp:20, sl:-15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
