@@ -5,8 +5,8 @@ const DLMM = DLMMImport.default ?? DLMMImport;
 const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
 const BN = require('bn.js');
 const { sendConfirm, confirmSig } = require('./sendtx.cjs');
-const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
-const SOLM = "So11111111111111111111111111111111111111112";
+const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
+const SOLM = CFG.QUOTE_MINT;
 const arg = (k) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : null; };
 // Same reasoning as deploy.cjs: never abandon a half-finished withdrawal.
 process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avoid a half-closed position'));
@@ -44,7 +44,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avo
       }
     } catch(e){}
     if (!ok) {
-      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${MINT}&outputMint=${SOLM}&amount=${raw}&slippageBps=300`, { headers:{'x-api-key':JK} })).json();
+      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${MINT}&outputMint=${SOLM}&amount=${raw}&slippageBps=${CFG.SLIPPAGE_BPS}`, { headers:{'x-api-key':JK} })).json();
       const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
         body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
       const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);

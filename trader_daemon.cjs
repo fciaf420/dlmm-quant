@@ -2,10 +2,11 @@
 // Manage every TICK_MS; scan+deploy every SCAN_MS. Events -> events.log (+ macOS notification).
 const fs = require('fs'); const { execFileSync } = require('child_process');
 const DIR = __dirname;
-const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
+const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
+const SOLM = CFG.QUOTE_MINT;
 const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
-const TICK_MS = 120e3, SCAN_EVERY = 7; // scan every 7th tick (~14 min)
+const TICK_MS = CFG.TICK_MS, SCAN_EVERY = CFG.SCAN_EVERY;
 const NODE = process.execPath;
 const HEARTBEAT = DIR + '/daemon.heartbeat';
 let tick = 0;
@@ -99,19 +100,21 @@ async function manage(){
 
 async function scan(){
   const s = st(); const positions = reg(); let seen = 0;
-  if (positions.length >= 2) { log('scan skipped: 2 positions open'); return 'scan skipped (2 open)'; }
+  if (positions.length >= CFG.MAX_POSITIONS) { log(`scan skipped: ${positions.length} positions open`); return `scan skipped (${positions.length} open)`; }
   const bd = await jget(`${MET}/pools?sort_by=volume_24h:desc&page_size=100`);
-  const B = (bd.data||bd).filter(p=>(p.tvl||0)>=60000 && (p.volume?.["24h"]||0)>=150000);
+  // token_y must be SOL: deploy.cjs swaps SOL->token_x and treats the Y side as lamports,
+  // so SOL-first pools (SOL-HYPE) and USDC-quoted pools can't be deployed by this path.
+  const B = (bd.data||bd).filter(p=>(p.tvl||0)>=CFG.MIN_TVL && (p.volume?.["24h"]||0)>=CFG.MIN_VOL_24H && p.token_y?.address===SOLM);
   B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
   B.sort((a,b)=>b._fr-a._fr);
   let best = null;
-  const cands = B.slice(0,8);
+  const cands = B.slice(0, CFG.SCAN_TOP_N);
   hb(`scanning: ${(bd.data||bd).length} pools -> ${B.length} pass tvl/vol -> checking top ${cands.length} by fee rate`);
   for (const [i, p] of cands.entries()) {
     const n = `${i+1}/${cands.length} ${(p.name||'?').padEnd(16).slice(0,16)}`;
     if (positions.find(r=>r.pool===p.address)) { sc(`${n} skip: already holding`); continue; }
-    if (s.cooldowns[p.address] && Date.now()-s.cooldowns[p.address] < 2*3600e3) {
-      const mins = Math.round((2*3600e3 - (Date.now()-s.cooldowns[p.address]))/60e3);
+    if (s.cooldowns[p.address] && Date.now()-s.cooldowns[p.address] < CFG.COOLDOWN_H*3600e3) {
+      const mins = Math.round((CFG.COOLDOWN_H*3600e3 - (Date.now()-s.cooldowns[p.address]))/60e3);
       sc(`${n} skip: cooldown ${mins}m left`); continue;
     }
     try {
@@ -146,18 +149,18 @@ async function scan(){
       if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2))) {
         const Wp = Math.min(30,Math.max(12,Math.round(sigma/4)));
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
-        sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?0.4:0.3,
+        sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?CFG.SIZE_IGNITION_HI:CFG.SIZE_IGNITION,
           tp: Math.min(25,Math.max(8,Math.round(Wp/4 + p._fr*0.5))), sl: -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
       }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5)
-        sig = { label:'BASING', mode:'two', widthPct:18, size:0.3, tp:20, sl:-15, stop: low?low*0.98:0 };
+        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp:20, sl:-15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
-        sig = { label:'CARRY', mode:'two', widthPct:35, size:0.4, tp:15, sl:-12, stop:0 };
+        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp:15, sl:-12, stop:0 };
       else if (sigmaRatio != null && sigmaRatio <= 0.6 && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
         const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
-        sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: 0.3,
+        sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
           tp: Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
       sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);

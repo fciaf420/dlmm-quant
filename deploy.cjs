@@ -6,8 +6,8 @@ const { StrategyType } = DLMMImport;
 const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
 const BN = require('bn.js');
 const { sendConfirm, confirmSig } = require('./sendtx.cjs');
-const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
-const SOLM = "So11111111111111111111111111111111111111112";
+const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
+const SOLM = CFG.QUOTE_MINT;
 const arg = (k, d) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : d; };
 const DRY = process.argv.includes('--dry');
 // Ctrl-C in a terminal hits the whole process group. Killing mid-deploy can leave an
@@ -30,8 +30,15 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   process.on('exit', () => { try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch(e){} });
   const reg0 = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
   if (reg0.find(r => r.pool === POOL)) { console.error('DUPLICATE: position already exists for this pool'); process.exit(4); }
-  if (reg0.length >= 2) { console.error('CAP: 2 positions already open'); process.exit(5); }
+  if (reg0.length >= CFG.MAX_POSITIONS) { console.error(`CAP: ${reg0.length} positions already open (MAX_POSITIONS=${CFG.MAX_POSITIONS})`); process.exit(5); }
   const pool = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${POOL}`)).json();
+  // The whole deploy assumes X is the token being bought and Y is SOL: it swaps SOL->X
+  // and passes solSide*1e9 as totalYAmount. Pools quoted in anything else (SOL-HYPE has
+  // X=SOL, USDC pools have Y=USDC) would swap SOL->SOL and deposit the wrong decimals.
+  if (pool.token_y?.address !== SOLM) {
+    console.error(`UNSUPPORTED QUOTE: ${pool.name} has token_y=${pool.token_y?.symbol||'?'}, expected SOL — this deploy path only handles X/SOL pools`);
+    process.exit(6);
+  }
   const MINT = pool.token_x.address;
   const binStepPct = pool.pool_config.bin_step / 100;
   // Position sizing. initializePositionAndAddLiquidityByStrategy creates the account via
@@ -44,7 +51,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   // with "memory allocation failed, out of memory" well below that: 351 bins OOMs, 145
   // funds fine. The exact ceiling between those is unmeasured, so cap conservatively.
   // Override with --maxBins once a higher value is known to work.
-  const MAX_BINS = Math.min(+arg('maxBins', '140'), DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400);
+  const MAX_BINS = Math.min(+arg('maxBins', String(CFG.MAX_BINS)), DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400);
   const maxHalf = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
   const wanted = Math.max(3, Math.round(widthPct / binStepPct));
   const widthBins = Math.min(wanted, maxHalf);
@@ -57,9 +64,9 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   const acctSize = (DLMMImport.POSITION_MIN_SIZE ?? 8112) + Math.max(0, totalBins - DEF_BINS) * (DLMMImport.POSITION_BIN_DATA_SIZE ?? 112);
   const rent = (await conn.getMinimumBalanceForRentExemption(acctSize)) / 1e9;
   const bal = await conn.getBalance(user.publicKey);
-  const need = size + rent + 0.08; // + bin array init and gas headroom
+  const need = size + rent + CFG.FEE_BUFFER_SOL; // + bin array init and gas headroom
   console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${effPct}% (${totalBins} bins${extended?', extended':''}) rent ${rent.toFixed(4)} tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
-  if (bal/1e9 < need) { console.error(`INSUFFICIENT: need ${need.toFixed(4)} SOL (${size} position + ${rent.toFixed(4)} rent + 0.08 fees), have ${(bal/1e9).toFixed(4)}`); process.exit(2); }
+  if (bal/1e9 < need) { console.error(`INSUFFICIENT: need ${need.toFixed(4)} SOL (${size} position + ${rent.toFixed(4)} rent + ${CFG.FEE_BUFFER_SOL} fees), have ${(bal/1e9).toFixed(4)}`); process.exit(2); }
   if (DRY) { console.log('DRY RUN OK'); return; }
   let totalX = new BN(0);
   let swapSOL = mode === 'two' ? size/2 : 0;
@@ -84,9 +91,11 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       }
     } catch(e){ console.log('v2 err', e.message); }
     if (!ok) {
-      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&slippageBps=300`, { headers:{'x-api-key':JK} })).json();
+      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&slippageBps=${CFG.SLIPPAGE_BPS}`, { headers:{'x-api-key':JK} })).json();
       const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
         body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
+      // Without this the failure surfaces as a bare "Buffer.from received undefined".
+      if (!sw.swapTransaction) throw new Error(`jupiter v1 swap returned no transaction: ${JSON.stringify(sw.error||q.error||sw).slice(0,200)}`);
       const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
       const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
       await confirmSig(conn, sig, 'swap v1'); console.log('swap v1:', sig);
