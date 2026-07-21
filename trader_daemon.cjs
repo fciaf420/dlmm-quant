@@ -131,10 +131,18 @@ async function scan(){
       // delta history (foundation for squeeze detection)
       if (!s.history) s.history = {};
       { const h = s.history[p.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.address] = h.slice(-40); }
-      let sigmaTrail = null, sigmaRatio = null;
+      let sigmaTrail = null, sigmaRatio = null, sqzPersist = false;
       { const h = s.history[p.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
         const spanMin = h.length >= 2 ? (h[h.length-1].ts - h[0].ts) / 60e3 : 0;
-        if (prior.length >= 6 && spanMin >= 45) { const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)]; sigmaRatio = sigma / Math.max(sigmaTrail, 0.001); } }
+        if (prior.length >= 6 && spanMin >= 45) {
+          const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)];
+          const recent = h.slice(-3).map(x=>x.sigma).sort((a,b)=>a-b);
+          const sigmaNow = recent[Math.floor(recent.length/2)];   // smoothed: median of last 3
+          sigmaRatio = sigmaNow / Math.max(sigmaTrail, 0.001);
+          h[h.length-1].ratio = Math.round(sigmaRatio*100)/100;
+          const prevRatio = h.length >= 2 ? h[h.length-2].ratio : null;
+          sqzPersist = (sigmaRatio <= 0.6 && prevRatio != null && prevRatio <= 0.6);  // 2 consecutive scans
+        } }
 
       let dd=null,pos=null,low=null;
       try { const oh = await jget(`${MET}/pools/${p.address}/ohlcv`); const c=(oh.data||oh).slice(-1)[0];
@@ -156,7 +164,7 @@ async function scan(){
         sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp:20, sl:-15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
         sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp:15, sl:-12, stop:0 };
-      else if (sigmaRatio != null && sigmaRatio <= 0.6 && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
+      else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
         const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
