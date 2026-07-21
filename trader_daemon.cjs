@@ -130,9 +130,9 @@ async function scan(){
       const org = t.organicScore||0;
       // delta history (foundation for squeeze detection)
       if (!s.history) s.history = {};
-      { const h = s.history[p.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.address] = h.slice(-40); }
+      { const h = s.history[p.token_x.address] || []; h.push({ ts: Date.now(), feeRate: +p._fr.toFixed(2), sigma: +sigma.toFixed(1), surge: +p._sg.toFixed(2) }); s.history[p.token_x.address] = h.slice(-40); }
       let sigmaTrail = null, sigmaRatio = null, sqzPersist = false;
-      { const h = s.history[p.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
+      { const h = s.history[p.token_x.address] || []; const prior = h.slice(0, -1).map(x => x.sigma).filter(x => x > 0);
         const spanMin = h.length >= 2 ? (h[h.length-1].ts - h[0].ts) / 60e3 : 0;
         if (prior.length >= 6 && spanMin >= 45) {
           const srt=[...prior].sort((a,b)=>a-b); sigmaTrail = srt[Math.floor(srt.length/2)];
