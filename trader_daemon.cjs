@@ -61,11 +61,19 @@ async function manage(){
       const pnl = await jget(`${MET}/positions/${p.pool}/pnl?user=${WALLET}&status=open`);
       if (!pnl.totalCount) {
         ev(`EXTERNAL CLOSE detected ${p.name} — removing from registry`);
+        if (s.oorTicks) delete s.oorTicks[p.pool];
         fs.writeFileSync(DIR+'/positions.json', JSON.stringify(reg().filter(r=>r.pool!==p.pool),null,1));
         continue;
       }
       const pos = pnl.positions[0];
       const pnlPct = +pos.pnlSolPctChange, price = +pos.poolActivePrice;
+      // OOR tracking: out of range = zero fee income = the vol-selling thesis is dead.
+      // 2 consecutive manage ticks (~4 min) filters single-wick noise (same persistence
+      // pattern as FEE-DECAY and the squeeze anti-flap).
+      const oor = pos.isOutOfRange === true;
+      const oorDir = oor ? (price > +pos.maxPrice ? 'UP' : 'DOWN') : null;
+      s.oorTicks = s.oorTicks || {};
+      s.oorTicks[p.pool] = oor ? (s.oorTicks[p.pool] || 0) + 1 : 0;
       const pool = await jget(`${MET}/pools/${p.pool}`);
       const feeRate = (pool.fee_tvl_ratio?.["1h"]||0)*24;
       const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${p.mint}`, true);
@@ -76,6 +84,7 @@ async function manage(){
       if (pnlPct >= p.tpPct) trigger = `TP (${pnlPct.toFixed(1)}% >= ${p.tpPct})`;
       else if (p.stopPrice > 0 && price < p.stopPrice) trigger = `STOP-PRICE (${price.toExponential(2)} < ${p.stopPrice.toExponential(2)})`;
       else if (pnlPct <= p.slPct) trigger = `SL (${pnlPct.toFixed(1)}% <= ${p.slPct})`;
+      else if ((s.oorTicks[p.pool] || 0) >= 2) trigger = `OOR-${oorDir} x${s.oorTicks[p.pool]} ticks (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
       else if (feeRate < 0.5*p.entryFeeRate && (s.lastFeeRates[p.pool]??99) < 0.5*p.entryFeeRate) trigger = `FEE-DECAY (${feeRate.toFixed(1)} < half of ${p.entryFeeRate.toFixed(1)}, x2)`;
       else if (ofi > 3 && pc1 < -15) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
       else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > 24*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved 24h, pnl ${pnlPct.toFixed(1)}%)`;
@@ -86,6 +95,7 @@ async function manage(){
           const out = execFileSync(NODE, [DIR+'/exit.cjs','--pool',p.pool], { cwd: DIR, timeout: 480e3 }).toString();
           const fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
           s.cooldowns[p.pool] = Date.now();
+          if (s.oorTicks) delete s.oorTicks[p.pool];
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
         } catch(e){ ev(`EXIT FAILED ${p.name}: ${String(e.message).slice(0,120)} — will retry next tick`); }
       } else {
