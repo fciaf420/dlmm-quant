@@ -3,6 +3,7 @@
 const fs = require('fs'); const { execFileSync } = require('child_process');
 const DIR = __dirname;
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
+const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
 const SOLM = CFG.QUOTE_MINT;
 const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
@@ -133,7 +134,10 @@ async function scan(){
       seen++;
       const ageH = t.createdAt ? (Date.now()-new Date(t.createdAt).getTime())/3600e3 : 999;
       const pc5=t.stats5m?.priceChange||0, pc1=t.stats1h?.priceChange||0, pc24=t.stats24h?.priceChange||0;
-      const sigma = ageH>=24 ? Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, Math.abs(pc24)) : Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, 60);
+      // RV sigma from 5m OHLCV (one call also yields dd/pos/low below); legacy fallback for thin data
+      let dd=null,pos=null,low=null,rv=null;
+      try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; } catch(e){}
+      const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
       const edge = ((p._fr*0.9)/Math.max(sigma,.001)) / Math.max(1.3*sigma/160,.001);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
@@ -154,9 +158,6 @@ async function scan(){
           sqzPersist = (sigmaRatio <= 0.6 && prevRatio != null && prevRatio <= 0.6);  // 2 consecutive scans
         } }
 
-      let dd=null,pos=null,low=null;
-      try { const oh = await jget(`${MET}/pools/${p.address}/ohlcv`); const c=(oh.data||oh).slice(-1)[0];
-        if(c){ dd=(c.high-c.close)/c.high*100; pos=(c.close-c.low)/Math.max(c.high-c.low,1e-18); low=c.low; } } catch(e){}
       let path="CHOP";
       if (pc1<=-25 || (pc5<=-8 && pc1<0)) path="FREEFALL";
       else if ((dd??0)>=40 && Math.abs(pc5)<5 && pc1>-15) path="BASING";

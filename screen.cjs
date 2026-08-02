@@ -1,4 +1,5 @@
 const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
+const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
 (async () => {
   const bd = await (await fetch("https://dlmm.datapi.meteora.ag/pools?sort_by=volume_24h:desc&page_size=100")).json();
   const B = (bd.data||bd).filter(p=>(p.tvl||0)>=60000 && (p.volume?.["24h"]||0)>=150000);
@@ -11,15 +12,11 @@ const { RPC_URL, JUP_KEY: JK, keypair } = require("./config.cjs");
       const t = Array.isArray(tk)?tk[0]:null; if(!t) continue;
       const ageH = t.createdAt ? (Date.now()-new Date(t.createdAt).getTime())/3600000 : 999;
       const pc5=t.stats5m?.priceChange||0, pc1=t.stats1h?.priceChange||0, pc24=t.stats24h?.priceChange||0;
-      const sigma = ageH>=24 ? Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, Math.abs(pc24)) : Math.max(Math.abs(pc5)*17, Math.abs(pc1)*4.9, 60);
-      const edge = ((p._fr*0.9)/Math.max(sigma,0.001)) / Math.max(1.3*sigma/160, 0.001);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
-      let dd=null, pos=null, path="?";
-      try {
-        const oh = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${p.address}/ohlcv`)).json();
-        const cs = oh.data||oh; const c = Array.isArray(cs)&&cs.length ? cs[cs.length-1] : null;
-        if(c){ dd=(c.high-c.close)/c.high*100; pos=(c.close-c.low)/Math.max(c.high-c.low,1e-18); }
-      } catch(e){}
+      let dd=null, pos=null, path="?", rv=null;
+      try { const vd = await fetchVolDay(p.address); rv=vd.rv; dd=vd.dd; pos=vd.pos; } catch(e){}
+      const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);   // RV primary, legacy fallback
+      const edge = ((p._fr*0.9)/Math.max(sigma,0.001)) / Math.max(1.3*sigma/160, 0.001);
       if (pc1<=-25 || (pc5<=-8 && pc1<0)) path="FREEFALL";
       else if ((dd??0)>=40 && Math.abs(pc5)<5 && pc1>-15) path="BASING";
       else if ((pos??0)>0.85 && pc1>40) path="BLOWOFF";
