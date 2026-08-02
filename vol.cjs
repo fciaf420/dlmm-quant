@@ -16,11 +16,24 @@ function computeRealizedVol(candles) {
   const rets = [];
   for (let i = 1; i < closes.length; i++) rets.push(Math.log(closes[i] / closes[i - 1]));
   const recent = rets.slice(-48);          // last ~4h of 5m returns
-  if (recent.length < 6) return null;      // too thin: caller falls back to legacy estimator
-  const lambda = 0.9;                      // newest return ~10% weight, half-life ~33min
-  let v = 0, wsum = 0, w = 1;
-  for (let i = recent.length - 1; i >= 0; i--) { v += w * recent[i] * recent[i]; wsum += w; w *= lambda; }
-  return Math.sqrt(v / Math.max(wsum, 1e-12)) * Math.sqrt(288) * 100;  // per-5m -> %/day
+  if (recent.length >= 6) {
+    const lambda = 0.9;                    // newest return ~10% weight, half-life ~33min
+    let v = 0, wsum = 0, w = 1;
+    for (let i = recent.length - 1; i >= 0; i--) { v += w * recent[i] * recent[i]; wsum += w; w *= lambda; }
+    return Math.sqrt(v / Math.max(wsum, 1e-12)) * Math.sqrt(288) * 100;  // per-5m -> %/day
+  }
+  // Young pool (<~35 min): Parkinson estimator on high-low ranges — ~5x more
+  // information per candle than close-to-close, usable from 3 candles (~15 min).
+  const hl = [];
+  for (const c of candles || []) {
+    const h = Number(c.high), l = Number(c.low);
+    if (isFinite(h) && isFinite(l) && l > 0 && h >= l) hl.push(Math.log(h / l));
+  }
+  if (hl.length >= 3) {
+    const m = hl.reduce((a, b) => a + b * b, 0) / hl.length;
+    return Math.sqrt(m / (4 * Math.LN2)) * Math.sqrt(288) * 100;
+  }
+  return null;  // <15 min of candles: caller falls back to legacy estimator
 }
 
 // Two parallel calls (the datapi caps 5m range at ~8h, so one 24h/5m call 400s):
