@@ -210,6 +210,15 @@ async function scan(){
           tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
       sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}  https://www.meteora.ag/dlmm/${p.address}`);
+      // SHADOW LOG: persist every evaluation (signal or not) for counterfactual replay.
+      // Zero extra API calls - this is data already in hand. Review with: node replay.cjs
+      try {
+        fs.appendFileSync(DIR + '/shadow.jsonl', JSON.stringify({ t: Date.now(), pool: p.address, name: p.name,
+          tvl: Math.round(p.tvl || 0), fr: +p._fr.toFixed(2), sg: +p._sg.toFixed(2), ac: +p._ac.toFixed(2),
+          sigma: +sigma.toFixed(1), src: rv != null ? 'rv' : 'lg', edge: +edge.toFixed(3),
+          ofi: +ofi.toFixed(2), ofi6: +ofi6.toFixed(2), org: Math.round(org), path, ageH: +ageH.toFixed(1),
+          dd: dd != null ? Math.round(dd) : null, sig: sig ? sig.label : null, w: sig ? sig.widthPct : null }) + '\n');
+      } catch (e) {}
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }

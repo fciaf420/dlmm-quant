@@ -18,3 +18,5 @@ smoke_*.json
 .deploy.lock/
 STOP
 trades.json
+shadow.jsonl
+replay-cache.json
