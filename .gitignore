@@ -17,3 +17,4 @@ basing_meta.json
 smoke_*.json
 .deploy.lock/
 STOP
+trades.json

@@ -54,6 +54,19 @@ function blocker(edge, sg, ac, org, path, ageH, ofi){
 }
 async function jget(u, jup){ const r = await fetch(u, jup?{headers:{'x-api-key':JK}}:undefined); if(!r.ok) throw new Error(`${r.status} ${u.slice(0,60)}`); return r.json(); }
 
+// ---- TRADE JOURNAL: the registry row is deleted on exit, so persist it (plus the
+// exit context) to trades.json — the origin-pure calibration dataset calibrate.cjs
+// reads. Every CLI trade is signal-driven by construction, so per-class bracket
+// tuning from this file satisfies the calibration-contamination rule by design.
+function journalTrade(p, exitTrigger, pnlPctAtExit, walletSolAfter) {
+  try {
+    const f = DIR + '/trades.json';
+    const tj = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : [];
+    tj.push({ ...p, exitTrigger, pnlPctAtExit, walletSolAfter, closedAt: new Date().toISOString() });
+    fs.writeFileSync(f, JSON.stringify(tj.slice(-500), null, 1));
+  } catch (e) { log('journal err: ' + e.message); }
+}
+
 async function manage(){
   const positions = reg(); if(!positions.length) return [];
   const s = st(); const held = [];
@@ -63,6 +76,7 @@ async function manage(){
       if (!pnl.totalCount) {
         ev(`EXTERNAL CLOSE detected ${p.name} — removing from registry`);
         if (s.oorTicks) delete s.oorTicks[p.pool];
+        journalTrade(p, 'EXTERNAL', null, null);
         fs.writeFileSync(DIR+'/positions.json', JSON.stringify(reg().filter(r=>r.pool!==p.pool),null,1));
         continue;
       }
@@ -97,6 +111,7 @@ async function manage(){
           const fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
           s.cooldowns[p.pool] = Date.now();
           if (s.oorTicks) delete s.oorTicks[p.pool];
+          journalTrade(p, trigger, +pnlPct.toFixed(2), fin ? +fin : null);
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
         } catch(e){ ev(`EXIT FAILED ${p.name}: ${String(e.message).slice(0,120)} — will retry next tick`); }
       } else {
@@ -176,18 +191,23 @@ async function scan(){
         const Wp = Math.min(30,Math.max(12,Math.round(sigma/4)));
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
         sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?CFG.SIZE_IGNITION_HI:CFG.SIZE_IGNITION,
-          tp: CFG.TP_IGNITION || Math.min(25,Math.max(8,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
+          // TP is CAP-AWARE: a two-sided band's max price-driven PnL is exactly W/4
+          // (above the band you are 100% SOL); everything beyond is fees. Old min
+          // clamp of 8 made low-fee TPs fictional — OOR-UP was doing the real booking.
+          tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
       }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5)
-        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || 20, sl: CFG.SL_BASING ? -CFG.SL_BASING : -15, stop: low?low*0.98:0 };
+        // cap-aware: 18/4=4.5 appreciation cap + ~1 day of fees (entry gate requires fr>=15)
+        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(4.5 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
-        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || 15, sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -12, stop:0 };
+        // cap-aware: 35/4=8.75 appreciation cap + ~2 days of fees (carries are multi-day)
+        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(8.75 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -12, stop:0 };
       else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
         const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
-          tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
+          tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
       sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
       if (sig && !best) best = { p, sig };
