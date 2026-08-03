@@ -85,10 +85,10 @@ async function manage(){
       if (pnlPct >= p.tpPct) trigger = `TP (${pnlPct.toFixed(1)}% >= ${p.tpPct})`;
       else if (p.stopPrice > 0 && price < p.stopPrice) trigger = `STOP-PRICE (${price.toExponential(2)} < ${p.stopPrice.toExponential(2)})`;
       else if (pnlPct <= p.slPct) trigger = `SL (${pnlPct.toFixed(1)}% <= ${p.slPct})`;
-      else if ((s.oorTicks[p.pool] || 0) >= 2) trigger = `OOR-${oorDir} x${s.oorTicks[p.pool]} ticks (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
-      else if (feeRate < 0.5*p.entryFeeRate && (s.lastFeeRates[p.pool]??99) < 0.5*p.entryFeeRate) trigger = `FEE-DECAY (${feeRate.toFixed(1)} < half of ${p.entryFeeRate.toFixed(1)}, x2)`;
-      else if (ofi > 3 && pc1 < -15) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
-      else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > 24*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved 24h, pnl ${pnlPct.toFixed(1)}%)`;
+      else if ((s.oorTicks[p.pool] || 0) >= CFG.OOR_TICKS) trigger = `OOR-${oorDir} x${s.oorTicks[p.pool]} ticks (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
+      else if (feeRate < CFG.FEE_DECAY_FRAC*p.entryFeeRate && (s.lastFeeRates[p.pool]??99) < CFG.FEE_DECAY_FRAC*p.entryFeeRate) trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of ${p.entryFeeRate.toFixed(1)}, x2)`;
+      else if (ofi > CFG.FLOW_OFI && pc1 < CFG.FLOW_PC1) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
+      else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > CFG.SQZ_TIMEOUT_H*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved ${CFG.SQZ_TIMEOUT_H}h, pnl ${pnlPct.toFixed(1)}%)`;
       s.lastFeeRates[p.pool] = feeRate;
       if (trigger) {
         ev(`EXIT ${p.label} ${p.name}: ${trigger} | pnl ${pnlPct.toFixed(2)}%`);
@@ -176,18 +176,18 @@ async function scan(){
         const Wp = Math.min(30,Math.max(12,Math.round(sigma/4)));
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
         sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?CFG.SIZE_IGNITION_HI:CFG.SIZE_IGNITION,
-          tp: Math.min(25,Math.max(8,Math.round(Wp/4 + p._fr*0.5))), sl: -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
+          tp: CFG.TP_IGNITION || Math.min(25,Math.max(8,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
       }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5)
-        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp:20, sl:-15, stop: low?low*0.98:0 };
+        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || 20, sl: CFG.SL_BASING ? -CFG.SL_BASING : -15, stop: low?low*0.98:0 };
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
-        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp:15, sl:-12, stop:0 };
+        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || 15, sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -12, stop:0 };
       else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
         const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
-          tp: Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
+          tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(8, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
       sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
       if (sig && !best) best = { p, sig };

@@ -56,6 +56,25 @@ const CFG = {
   MAX_BINS:        num('MAX_BINS', 140),     // AddLiquidityByStrategy2 OOMs above ~145
   FEE_BUFFER_SOL:  num('FEE_BUFFER_SOL', 0.08), // headroom over position + rent
   SLIPPAGE_BPS:    num('SLIPPAGE_BPS', 300),
+
+  // exit rulebook (manage loop). Defaults = long-standing hardcoded behavior.
+  FEE_DECAY_FRAC:  num('FEE_DECAY_FRAC', 0.5),   // exit when 1h fee rate < this fraction of entry (x2 ticks)
+  FLOW_OFI:        num('FLOW_OFI', 3),           // flow-flip: organic sell:buy ratio above this...
+  FLOW_PC1:        num('FLOW_PC1', -15),         // ...while 1h price change below this (%)
+  OOR_TICKS:       num('OOR_TICKS', 2),          // consecutive out-of-range ticks before exit
+  SQZ_TIMEOUT_H:   num('SQZ_TIMEOUT_H', 24),     // squeeze time-stop (hours, |pnl|<3%)
+
+  // TP/SL overrides per class, in % (SL as a POSITIVE number, e.g. 12 means -12%).
+  // 0 = keep the class formula/default. Overrides apply at DEPLOY time (stamped
+  // into the registry entry), so changing them only affects new positions.
+  TP_IGNITION:     num('TP_IGNITION', 0),
+  SL_IGNITION:     num('SL_IGNITION', 0),
+  TP_BASING:       num('TP_BASING', 0),
+  SL_BASING:       num('SL_BASING', 0),
+  TP_CARRY:        num('TP_CARRY', 0),
+  SL_CARRY:        num('SL_CARRY', 0),
+  TP_SQUEEZE:      num('TP_SQUEEZE', 0),
+  SL_SQUEEZE:      num('SL_SQUEEZE', 0),
 };
 
 module.exports = { RPC_URL, JUP_KEY, keypair, CFG };
