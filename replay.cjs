@@ -71,8 +71,22 @@ async function simulate(row) {
 }
 
 (async () => {
-  if (!fs.existsSync(DIR + '/shadow.jsonl')) { console.log('shadow.jsonl not found — it accrues while the daemon runs.'); return; }
-  const rows = fs.readFileSync(DIR + '/shadow.jsonl', 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean);
+  // ingest the daemon's own log plus any extension exports (shadow-*.jsonl) dropped here
+  const files = fs.readdirSync(DIR).filter((f) => f === 'shadow.jsonl' || (/^shadow-.*\.jsonl$/.test(f)));
+  if (!files.length) { console.log('no shadow logs found — shadow.jsonl accrues while the daemon runs; export shadow-lens-*.jsonl from the Quant Lens options page.'); return; }
+  const seen = new Set();
+  const rows = [];
+  for (const file of files) {
+    for (const l of fs.readFileSync(DIR + '/' + file, 'utf8').split('\n')) {
+      if (!l) continue;
+      try {
+        const r = JSON.parse(l);
+        const k = r.t + ':' + r.pool;
+        if (!seen.has(k)) { seen.add(k); rows.push(r); }
+      } catch (e) {}
+    }
+  }
+  console.log('sources: ' + files.join(', '));
   const cache = fs.existsSync(DIR + '/replay-cache.json') ? JSON.parse(fs.readFileSync(DIR + '/replay-cache.json', 'utf8')) : {};
   let fetched = 0;
   for (const row of rows) {
