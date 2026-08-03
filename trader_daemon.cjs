@@ -105,7 +105,7 @@ async function manage(){
       else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > CFG.SQZ_TIMEOUT_H*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved ${CFG.SQZ_TIMEOUT_H}h, pnl ${pnlPct.toFixed(1)}%)`;
       s.lastFeeRates[p.pool] = feeRate;
       if (trigger) {
-        ev(`EXIT ${p.label} ${p.name}: ${trigger} | pnl ${pnlPct.toFixed(2)}%`);
+        ev(`EXIT ${p.label} ${p.name}: ${trigger} | pnl ${pnlPct.toFixed(2)}%  https://www.meteora.ag/dlmm/${p.pool}`);
         try {
           const out = execFileSync(NODE, [DIR+'/exit.cjs','--pool',p.pool], { cwd: DIR, timeout: 480e3 }).toString();
           const fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
@@ -209,7 +209,7 @@ async function scan(){
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
           tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
-      sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}`);
+      sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}  https://www.meteora.ag/dlmm/${p.address}`);
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
@@ -224,7 +224,7 @@ async function scan(){
   }
   if (best) {
     const { p, sig } = best;
-    ev(`DEPLOY ${sig.label} ${p.name} size ${sig.size} width ±${sig.widthPct}% tp ${sig.tp} sl ${sig.sl}`);
+    ev(`DEPLOY ${sig.label} ${p.name} size ${sig.size} width ±${sig.widthPct}% tp ${sig.tp} sl ${sig.sl}  https://www.meteora.ag/dlmm/${p.address}`);
     try {
       const out = execFileSync(NODE, [DIR+'/deploy.cjs','--pool',p.address,'--size',String(sig.size),'--mode',sig.mode,
         '--widthPct',String(sig.widthPct),'--tp',String(sig.tp),'--sl',String(sig.sl),'--stopPrice',String(sig.stop),'--label',sig.label,'--shape',(sig.shape||'spot')], { cwd: DIR, timeout: 480e3 }).toString();

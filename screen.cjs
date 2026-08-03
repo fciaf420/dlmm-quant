@@ -22,7 +22,7 @@ const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
       else if ((pos??0)>0.85 && pc1>40) path="BLOWOFF";
       else if (pc1>0) path="GRIND-UP";
       else path="CHOP";
-      R.push({ name:p.name, tvl:Math.round(p.tvl/1000), fr:+p._fr.toFixed(1), edge:+edge.toFixed(2),
+      R.push({ addr:p.address, name:p.name, tvl:Math.round(p.tvl/1000), fr:+p._fr.toFixed(1), edge:+edge.toFixed(2),
         surge:+p._sg.toFixed(2), accel:+p._ac.toFixed(2), ofi:+ofi.toFixed(2), org:Math.round(t.organicScore||0),
         dd:dd!=null?Math.round(dd):null, pos:pos!=null?+pos.toFixed(2):null, pc5:+pc5.toFixed(1), pc1:+pc1.toFixed(1), path, ageH:+ageH.toFixed(1) });
       await new Promise(r=>setTimeout(r,140));
@@ -31,7 +31,7 @@ const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
   R.sort((a,b)=>b.edge-a.edge);
   console.log("run:", new Date().toISOString());
   console.log("pool | TVL$k | fee%/d | EDGE | surge | accel | OFI | org | dd% | rngPos | 5m% | 1h% | PATH");
-  for(const r of R) console.log(`${r.name} | ${r.tvl} | ${r.fr} | ${r.edge} | ${r.surge} | ${r.accel} | ${r.ofi} | ${r.org} | ${r.dd} | ${r.pos} | ${r.pc5} | ${r.pc1} | ${r.path}`);
+  for(const r of R) console.log(`${r.name} | ${r.tvl} | ${r.fr} | ${r.edge} | ${r.surge} | ${r.accel} | ${r.ofi} | ${r.org} | ${r.dd} | ${r.pos} | ${r.pc5} | ${r.pc1} | ${r.path} | https://www.meteora.ag/dlmm/${r.addr}`);
   const ign = R.filter(r=>r.edge>=1 && r.surge>=1.25 && r.accel>=1.2 && r.org>=40 && r.path!=="FREEFALL" && (r.ageH>=6 || (r.org>=60 && r.ofi<2)));
   const bas = R.filter(r=>r.path==="BASING" && r.ofi<=1.0 && r.org>=60 && r.fr>=15 && r.edge>=0.5);
   console.log("\nIGNITION:", ign.length?JSON.stringify(ign.map(r=>r.name)):"none");
