@@ -119,6 +119,7 @@ async function scan(){
   B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
   B.sort((a,b)=>b._fr-a._fr);
   let best = null;
+  let degradedSigma = 0;  // legacy-sigma fallbacks on mature (>1h) tokens this cycle
   const cands = B.slice(0, CFG.SCAN_TOP_N);
   hb(`scanning: ${(bd.data||bd).length} pools -> ${B.length} pass tvl/vol -> checking top ${cands.length} by fee rate`);
   for (const [i, p] of cands.entries()) {
@@ -138,6 +139,7 @@ async function scan(){
       let dd=null,pos=null,low=null,rv=null;
       try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
+      if (rv == null && ageH > 1) degradedSigma++;  // candles should exist for a >1h token
       const edge = ((p._fr*0.9)/Math.max(sigma,.001)) / Math.max(1.3*sigma/160,.001);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
@@ -191,6 +193,14 @@ async function scan(){
       if (sig && !best) best = { p, sig };
       await new Promise(r=>setTimeout(r,130));
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
+  }
+  // DATA-HEALTH GUARD (mirror of quant-lens v0.6.0 watchdog): if sigma fell back
+  // to the legacy estimator on 2+ mature tokens this cycle, candle data is broken
+  // and every edge/gate above was computed on a bad instrument. Warn AND refuse
+  // to deploy this cycle - do not trade on silently-degraded vol data.
+  if (degradedSigma >= 2) {
+    ev(`DEGRADED SIGMA: legacy fallback on ${degradedSigma} mature tokens this cycle (OHLCV data missing) - deploy suppressed`);
+    best = null;
   }
   if (best) {
     const { p, sig } = best;
