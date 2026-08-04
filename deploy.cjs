@@ -100,12 +100,24 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
       await confirmSig(conn, sig, 'swap v1'); console.log('swap v1:', sig);
     }
-    await new Promise(r=>setTimeout(r,2000));
-    const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
-    const raw = accs.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
+    // RPC-visibility race (caught live 2026-08-03, MENSA deploy): Jupiter's 'Success'
+    // can lead our RPC node's view by several seconds. A single 2s-wait read returned
+    // 0, and the deploy shipped a ONE-SIDED position while the swapped tokens sat
+    // stranded in the wallet. Poll until visible; if still invisible, ABORT - the
+    // idempotency block above reuses the held tokens on the next attempt.
+    let raw = 0;
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r=>setTimeout(r,2500));
+      const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
+      raw = accs.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
+      if (raw > 0) break;
+      console.log('swap output not visible yet, retry ' + (i+1) + '/12');
+    }
+    if (raw <= 0) throw new Error('swap reported success but tokens never became visible (30s) - aborting; retry will reuse held tokens');
     totalX = new BN(String(raw));
     console.log('token acquired (raw):', raw);
   }
+  if (mode === 'two' && totalX.isZero()) throw new Error('two-sided deploy with zero token side - refusing to open a mislabeled one-sided position');
   const solSide = mode === 'two' ? size/2 : size;
   const dlmm = await DLMM.create(conn, new PublicKey(POOL));
   const active = await dlmm.getActiveBin();
