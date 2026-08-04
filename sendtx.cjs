@@ -28,13 +28,28 @@ async function confirmSig(conn, sig, label, lastValidBlockHeight) {
   throw new Error(`${label||'tx'} not confirmed within ${CONFIRM_TIMEOUT_MS/1000}s (${sig})`);
 }
 
+// Blockhash-expiry retry (caught live: a 139-bin extended position-open took >60s
+// to land and expired). Expiry means the tx never executed, so re-signing the SAME
+// transaction with a FRESH blockhash is safe - not a double-spend. Legacy
+// web3.js Transactions allow mutating recentBlockhash and re-signing in place.
 async function sendConfirm(conn, tx, signers, label) {
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
-  tx.recentBlockhash = blockhash;
-  tx.feePayer = signers[0].publicKey;
-  tx.sign(...signers);
-  const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
-  return confirmSig(conn, sig, label, lastValidBlockHeight);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = signers[0].publicKey;
+    tx.signatures = [];          // clear prior attempt's signatures before re-signing
+    tx.sign(...signers);
+    const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+    try {
+      return await confirmSig(conn, sig, label, lastValidBlockHeight);
+    } catch (e) {
+      lastErr = e;
+      if (!/blockhash expired/.test(String(e.message))) throw e;   // real failures propagate
+      console.error(`${label || 'tx'} attempt ${attempt}/3 expired - retrying with fresh blockhash`);
+    }
+  }
+  throw lastErr;
 }
 
 module.exports = { sendConfirm, confirmSig };

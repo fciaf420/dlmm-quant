@@ -130,9 +130,12 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     }
     totalX = new BN(String(delta));
     console.log('token acquired (exact swap delta, raw):', delta);
+    // journal the swap output NOW: if anything after this fails (e.g. position-open
+    // blockhash expiry - caught live), the retry reuses this exact delta instead of
+    // swapping again and stranding the first buy
+    try { fs.writeFileSync(PEND, JSON.stringify({ mint: MINT, preRaw, swapSOL, ts: Date.now() })); } catch(e){}
   }
   if (mode === 'two' && totalX.isZero()) throw new Error('two-sided deploy with zero token side - refusing to open a mislabeled one-sided position');
-  try { const pd0 = JSON.parse(fs.readFileSync(PEND,'utf8')); if (pd0.mint === MINT) fs.rmSync(PEND); } catch(e){}
   const solSide = mode === 'two' ? size/2 : size;
   const dlmm = await DLMM.create(conn, new PublicKey(POOL));
   const active = await dlmm.getActiveBin();
@@ -171,6 +174,8 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     }
   }
   record({ funded: true });
+  // position landed + registry recorded: the swap-output ledger is consumed
+  try { const pd0 = JSON.parse(fs.readFileSync(PEND,'utf8')); if (pd0.mint === MINT) fs.rmSync(PEND); } catch(e){}
   console.log('DEPLOYED:', posKp.publicKey.toBase58(), `bins ${minBinId}..${maxBinId}`, '| registry updated');
 
   // Upsert this position into the registry. Called once for the standard path and twice
