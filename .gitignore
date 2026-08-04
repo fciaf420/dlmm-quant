@@ -20,3 +20,4 @@ STOP
 trades.json
 shadow.jsonl
 replay-cache.json
+.pending-swap.json

@@ -70,13 +70,25 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   if (DRY) { console.log('DRY RUN OK'); return; }
   let totalX = new BN(0);
   let swapSOL = mode === 'two' ? size/2 : 0;
-  // idempotency: if a prior timed-out attempt already swapped, reuse the held tokens
+  // DELTA ACCOUNTING: deposit exactly what THIS deploy's swap buys - never the
+  // wallet's total mint balance. The old total-balance read was fine on a dedicated
+  // bot wallet but on a shared/main wallet it would sweep PERSONAL holdings of the
+  // same token into the bot's position. Pre-balance is the baseline; a prior
+  // aborted attempt's output is reused via the .pending-swap.json ledger (exact
+  // recorded delta), not via a balance heuristic.
+  const readRaw = async () => {
+    const a = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
+    return a.value.reduce((s,x)=>s + Number(x.account.data.parsed.info.tokenAmount.amount), 0);
+  };
+  const PEND = __dirname + '/.pending-swap.json';
+  const preRaw = await readRaw().catch(()=>0);
   try {
-    const pre = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
-    const preRaw = pre.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
-    const preUi = pre.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.uiAmount), 0);
-    const preVal = preUi * (pool.current_price||0);
-    if (preVal > swapSOL * 0.5) { console.log('reusing held tokens from prior attempt:', preRaw); swapSOL = 0; totalX = new BN(String(preRaw)); }
+    const pd = JSON.parse(fs.readFileSync(PEND,'utf8'));
+    if (pd.mint === MINT && preRaw > pd.preRaw) {
+      const reuse = preRaw - pd.preRaw;   // tokens the PRIOR bot attempt bought (arrived late)
+      console.log('reusing prior attempt swap output (delta):', reuse);
+      swapSOL = 0; totalX = new BN(String(reuse));
+    }
   } catch(e){}
   if (swapSOL > 0) {
     const amt = Math.floor(swapSOL*1e9);
@@ -101,23 +113,26 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       await confirmSig(conn, sig, 'swap v1'); console.log('swap v1:', sig);
     }
     // RPC-visibility race (caught live 2026-08-03, MENSA deploy): Jupiter's 'Success'
-    // can lead our RPC node's view by several seconds. A single 2s-wait read returned
-    // 0, and the deploy shipped a ONE-SIDED position while the swapped tokens sat
-    // stranded in the wallet. Poll until visible; if still invisible, ABORT - the
-    // idempotency block above reuses the held tokens on the next attempt.
-    let raw = 0;
+    // can lead our RPC node's view by several seconds. Poll for the DELTA over the
+    // pre-swap baseline - the exact amount this swap bought, slippage included.
+    let delta = 0;
     for (let i = 0; i < 12; i++) {
       await new Promise(r=>setTimeout(r,2500));
-      const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
-      raw = accs.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
-      if (raw > 0) break;
+      delta = (await readRaw().catch(()=>preRaw)) - preRaw;
+      if (delta > 0) break;
       console.log('swap output not visible yet, retry ' + (i+1) + '/12');
     }
-    if (raw <= 0) throw new Error('swap reported success but tokens never became visible (30s) - aborting; retry will reuse held tokens');
-    totalX = new BN(String(raw));
-    console.log('token acquired (raw):', raw);
+    if (delta <= 0) {
+      // swap likely landed but our node is behind: journal the baseline so the
+      // RETRY reuses exactly what this attempt bought once it becomes visible
+      try { fs.writeFileSync(PEND, JSON.stringify({ mint: MINT, preRaw, swapSOL, ts: Date.now() })); } catch(e){}
+      throw new Error('swap output not visible after 30s - aborting; baseline journaled, retry reuses the exact delta');
+    }
+    totalX = new BN(String(delta));
+    console.log('token acquired (exact swap delta, raw):', delta);
   }
   if (mode === 'two' && totalX.isZero()) throw new Error('two-sided deploy with zero token side - refusing to open a mislabeled one-sided position');
+  try { const pd0 = JSON.parse(fs.readFileSync(PEND,'utf8')); if (pd0.mint === MINT) fs.rmSync(PEND); } catch(e){}
   const solSide = mode === 'two' ? size/2 : size;
   const dlmm = await DLMM.create(conn, new PublicKey(POOL));
   const active = await dlmm.getActiveBin();
