@@ -59,6 +59,7 @@ const CFG = {
 
   // exit rulebook (manage loop). Defaults = long-standing hardcoded behavior.
   FEE_DECAY_FRAC:  num('FEE_DECAY_FRAC', 0.5),   // exit when 1h fee rate < this fraction of entry (x2 ticks)
+  FEE_DECAY_VS_NORM: num('FEE_DECAY_VS_NORM', 1), // 1 = decay must ALSO be below the pool's 24h rate at entry (spike-bias guard); 0 = entry-relative only
   FLOW_OFI:        num('FLOW_OFI', 3),           // flow-flip: organic sell:buy ratio above this...
   FLOW_PC1:        num('FLOW_PC1', -15),         // ...while 1h price change below this (%)
   OOR_TICKS:       num('OOR_TICKS', 2),          // consecutive out-of-range ticks before exit

@@ -95,12 +95,20 @@ async function manage(){
       const t = Array.isArray(tk)?tk[0]:null;
       const ofi = t ? (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1) : 0;
       const pc1 = t?.stats1h?.priceChange||0;
+      // FEE-DECAY spike-bias guard: the scanner ranks by 1h fee rate, so entries are
+      // systematically at fee SPIKES - '50% of entry' reads normal mean-reversion as
+      // death (5/5 live exits were FEE-DECAY inside 40min, incl. CATE 'dying' at a
+      // healthy 7.3%%/d). Decay now also requires the rate to be below the pool's
+      // NORMAL level (24h rate at entry): below-entry AND below-normal = actually dying.
+      const normFee = (CFG.FEE_DECAY_VS_NORM && p.entryFeeRate24h > 0) ? p.entryFeeRate24h : 1e9;
       let trigger = null;
       if (pnlPct >= p.tpPct) trigger = `TP (${pnlPct.toFixed(1)}% >= ${p.tpPct})`;
       else if (p.stopPrice > 0 && price < p.stopPrice) trigger = `STOP-PRICE (${price.toExponential(2)} < ${p.stopPrice.toExponential(2)})`;
       else if (pnlPct <= p.slPct) trigger = `SL (${pnlPct.toFixed(1)}% <= ${p.slPct})`;
       else if ((s.oorTicks[p.pool] || 0) >= CFG.OOR_TICKS) trigger = `OOR-${oorDir} x${s.oorTicks[p.pool]} ticks (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
-      else if (feeRate < CFG.FEE_DECAY_FRAC*p.entryFeeRate && (s.lastFeeRates[p.pool]??99) < CFG.FEE_DECAY_FRAC*p.entryFeeRate) trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of ${p.entryFeeRate.toFixed(1)}, x2)`;
+      else if (feeRate < CFG.FEE_DECAY_FRAC*p.entryFeeRate && feeRate < normFee
+        && (s.lastFeeRates[p.pool]??1e9) < CFG.FEE_DECAY_FRAC*p.entryFeeRate && (s.lastFeeRates[p.pool]??1e9) < normFee)
+        trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of entry ${p.entryFeeRate.toFixed(1)}${normFee<1e9?` AND < norm ${normFee.toFixed(1)}`:''}, x2)`;
       else if (ofi > CFG.FLOW_OFI && pc1 < CFG.FLOW_PC1) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
       else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > CFG.SQZ_TIMEOUT_H*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved ${CFG.SQZ_TIMEOUT_H}h, pnl ${pnlPct.toFixed(1)}%)`;
       s.lastFeeRates[p.pool] = feeRate;

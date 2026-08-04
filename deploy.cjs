@@ -179,6 +179,7 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
     const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
       sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
+      entryFeeRate24h: pool.fee_tvl_ratio['24h']||0,   // the pool's NORMAL level (spike-bias guard for FEE-DECAY)
       tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded, openedAt: new Date().toISOString() , shape: arg('shape','spot') };
     const i = reg.findIndex(r => r.position === row.position);
     if (i >= 0) reg[i] = { ...reg[i], ...row }; else reg.push(row);
