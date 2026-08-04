@@ -195,8 +195,14 @@ async function scan(){
       else if (pc1>0) path="GRIND-UP";
       const audit = t.audit||{};
       let sig = null;
+      // BIN-BUDGET CAP at signal time: deploy clamps width to the 140-bin budget
+      // (fine bin steps need ~5x the bins per %%), but brackets were computed from
+      // the REQUESTED width - stamping TP/SL for a band that never deploys. Clamp
+      // here so brackets derive from the width that actually ships.
+      const binPct = (p.pool_config && p.pool_config.bin_step ? p.pool_config.bin_step : 0) / 100;
+      const wCap = binPct > 0 ? Math.floor((CFG.MAX_BINS - 1) / 2) * binPct : 999;
       if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2))) {
-        const Wp = Math.min(30,Math.max(12,Math.round(sigma/4)));
+        const Wp = Math.min(wCap, Math.min(30,Math.max(12,Math.round(sigma/4))));
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
         sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?CFG.SIZE_IGNITION_HI:CFG.SIZE_IGNITION,
           // TP is CAP-AWARE: a two-sided band's max price-driven PnL is exactly W/4
@@ -204,16 +210,20 @@ async function scan(){
           // clamp of 8 made low-fee TPs fictional — OOR-UP was doing the real booking.
           tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
       }
-      else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5)
-        // cap-aware: 18/4=4.5 appreciation cap + ~1 day of fees (entry gate requires fr>=15)
-        sig = { label:'BASING', mode:'two', widthPct:18, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(4.5 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -15, stop: low?low*0.98:0 };
-      else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path))
-        // cap-aware: 35/4=8.75 appreciation cap + ~2 days of fees (carries are multi-day)
-        sig = { label:'CARRY', mode:'two', widthPct:35, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(8.75 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -12, stop:0 };
+      else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5) {
+        // cap-aware: W/4 appreciation cap + ~1 day of fees (entry gate requires fr>=15)
+        const Wb = Math.min(wCap, 18);
+        sig = { label:'BASING', mode:'two', widthPct:Wb, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(15, Math.max(8, Math.round(0.75*Wb+2))), stop: low?low*0.98:0 };
+      }
+      else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path)) {
+        // cap-aware: W/4 appreciation cap + ~2 days of fees (carries are multi-day)
+        const Wc = Math.min(wCap, 35);
+        sig = { label:'CARRY', mode:'two', widthPct:Wc, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(Wc/4 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -Math.min(12, Math.max(8, Math.round(0.75*Wc+2))), stop:0 };
+      }
       else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
-        const Wq = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
+        const Wq = Math.min(wCap, Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4))));
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
           tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
       }
