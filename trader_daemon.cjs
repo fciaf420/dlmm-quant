@@ -113,7 +113,7 @@ async function manage(){
           if (s.oorTicks) delete s.oorTicks[p.pool];
           journalTrade(p, trigger, +pnlPct.toFixed(2), fin ? +fin : null);
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
-        } catch(e){ ev(`EXIT FAILED ${p.name}: ${String(e.message).slice(0,120)} — will retry next tick`); }
+        } catch(e){ ev(`EXIT FAILED ${p.name}: ${String((e.stderr||'') + ' | ' + (e.message||'')).replace(/\s+/g,' ').slice(0,300)} — will retry next tick`); }
       } else {
         log(`hold ${p.name} pnl=${pnlPct.toFixed(2)}% fee=${feeRate.toFixed(1)} ofi=${ofi.toFixed(2)}`);
         held.push(`${p.name} ${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%/f${feeRate.toFixed(0)}`);
@@ -238,7 +238,7 @@ async function scan(){
       const out = execFileSync(NODE, [DIR+'/deploy.cjs','--pool',p.address,'--size',String(sig.size),'--mode',sig.mode,
         '--widthPct',String(sig.widthPct),'--tp',String(sig.tp),'--sl',String(sig.sl),'--stopPrice',String(sig.stop),'--label',sig.label,'--shape',(sig.shape||'spot')], { cwd: DIR, timeout: 480e3 }).toString();
       ev(`DEPLOYED ${sig.label} ${p.name}: ${out.match(/DEPLOYED: (\S+)/)?.[1]||'ok'}`);
-    } catch(e){ ev(`DEPLOY FAILED ${p.name}: ${String(e.message).slice(0,150)}`); }
+    } catch(e){ ev(`DEPLOY FAILED ${p.name}: ${String((e.stderr||'') + ' | ' + (e.stdout||'')).replace(/\s+/g,' ').slice(0,300) || String(e.message).slice(0,150)}`); }
   }
   saveSt(s);
   return best ? `scanned ${seen} -> ${best.sig.label} ${best.p.name}` : `scanned ${seen}, no signal`;
