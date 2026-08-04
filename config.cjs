@@ -4,7 +4,14 @@ const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath,'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g,'');
+    if (m && !(m[1] in process.env)) {
+      // strip inline comments (VALUE  # comment) unless the value is quoted -
+      // an inline comment previously became part of the value, silently reverting
+      // the setting to its default (caught live: TICK_MS/SCAN_EVERY ignored)
+      let v = m[2];
+      if (!/^["']/.test(v)) v = v.replace(/\s+#.*$/, '');
+      process.env[m[1]] = v.trim().replace(/^["']|["']$/g,'');
+    }
   }
 }
 const RPC_URL = process.env.RPC_URL;
