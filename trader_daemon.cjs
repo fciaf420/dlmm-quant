@@ -117,7 +117,18 @@ async function manage(){
       if (pnlPct >= p.tpPct) trigger = `TP (${pnlPct.toFixed(1)}% >= ${p.tpPct})`;
       else if (p.stopPrice > 0 && price < p.stopPrice) trigger = `STOP-PRICE (${price.toExponential(2)} < ${p.stopPrice.toExponential(2)})`;
       else if (pnlPct <= p.slPct) trigger = `SL (${pnlPct.toFixed(1)}% <= ${p.slPct})`;
-      else if ((s.oorTicks[p.pool] || 0) >= CFG.OOR_TICKS) trigger = `OOR-${oorDir} x${s.oorTicks[p.pool]} ticks (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
+      // DEEP-LOSS BYPASS: the x2 persistence exists to filter transient wicks, but it
+      // RESETS on any single in-range tick - so price oscillating at the band edge kept
+      // it at zero while the position bled (caught live: SISYPUSS sat out-of-range at
+      // -14.7%% for ~45 min, never got 2 consecutive OOR ticks, and finally exited at
+      // -20.5%% on SL instead of ~-15%% on OOR). A position already deep in loss AND
+      // earning nothing outside its range is not a wick. Fires on DOWN in practice:
+      // OOR-UP means price pumped through the band, which books a gain.
+      else if (oor && ((s.oorTicks[p.pool] || 0) >= CFG.OOR_TICKS
+        || (CFG.OOR_DEEP_FRAC > 0 && p.slPct < 0 && pnlPct <= CFG.OOR_DEEP_FRAC * p.slPct)))
+        trigger = `OOR-${oorDir} ${((s.oorTicks[p.pool]||0) >= CFG.OOR_TICKS)
+          ? `x${s.oorTicks[p.pool]} ticks`
+          : `DEEP ${pnlPct.toFixed(1)}% past ${Math.round(CFG.OOR_DEEP_FRAC*100)}% of SL ${p.slPct}% — persistence bypassed`} (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
       else if (feeRate < CFG.FEE_DECAY_FRAC*p.entryFeeRate && feeRate < normFee
         && (s.lastFeeRates[p.pool]??1e9) < CFG.FEE_DECAY_FRAC*p.entryFeeRate && (s.lastFeeRates[p.pool]??1e9) < normFee)
         trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of entry ${p.entryFeeRate.toFixed(1)}${normFee<1e9?` AND < norm ${normFee.toFixed(1)}`:''}, x2)`;
