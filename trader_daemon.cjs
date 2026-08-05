@@ -183,8 +183,8 @@ async function scan(){
       const ageH = t.createdAt ? (Date.now()-new Date(t.createdAt).getTime())/3600e3 : 999;
       const pc5=t.stats5m?.priceChange||0, pc1=t.stats1h?.priceChange||0, pc24=t.stats24h?.priceChange||0;
       // RV sigma from 5m OHLCV (one call also yields dd/pos/low below); legacy fallback for thin data
-      let dd=null,pos=null,low=null,rv=null;
-      try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; } catch(e){}
+      let dd=null,pos=null,low=null,low6h=null,rv=null;
+      try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
       if (rv == null && ageH > 1) degradedSigma++;  // candles should exist for a >1h token
       const edge = ((p._fr*0.9)/Math.max(sigma,.001)) / Math.max(1.3*sigma/160,.001);
@@ -236,9 +236,30 @@ async function scan(){
           tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0, wantedPct: wantP };
       }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5) {
-        // cap-aware: W/4 appreciation cap + ~1 day of fees (entry gate requires fr>=15)
-        const Wb = Math.min(wCap, 18);
-        sig = { label:'BASING', mode:'two', widthPct:Wb, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(15, Math.max(8, Math.round(0.75*Wb+2))), stop: low?low*0.98:0, wantedPct: 18 };
+        // BASE-ANCHORED BAND: the class thesis is "price is chopping on a floor" - so the
+        // band's BOTTOM is placed AT that floor (recent consolidation low). Then leaving
+        // the band downward IS the base breaking: OOR-DOWN and the structural stop finally
+        // mean the same thing instead of contradicting each other.
+        //
+        // Before: fixed +-18%% band with a stop at the DAY low. On a crash-then-rally chart
+        // the day low sat multiples below the base (SISYPUSS: entry 7.26e-6, stop 1.60e-6 =
+        // -78%%), so the structural stop could never fire - the PnL SL and OOR-DOWN, ~2
+        // points of price apart, did all the work. Three loss rules, two duplicated, one
+        // dead, none expressing the actual thesis.
+        const px = Number(p.current_price) || 0;
+        const floor = (low6h > 0 && low6h < px) ? low6h : ((low > 0 && low < px) ? low : px * 0.85);
+        const rawW = px > 0 ? ((px - floor) / px) * 100 : 18;
+        const Wb = Math.min(wCap, Math.min(30, Math.max(8, Math.round(rawW))));
+        // stop just under the band bottom = base break confirmed (fast path; OOR-DOWN
+        // starts counting the moment price leaves the band)
+        const stopPx = px > 0 ? px * (1 - Wb/100) * 0.98 : 0;
+        // PnL SL becomes a genuine BACKSTOP below the band-break loss (~0.75W), not the
+        // primary risk rule - a mean-reversion straddle is structurally long the dip, so
+        // a tight PnL stop fights its own thesis.
+        sig = { label:'BASING', mode:'two', widthPct:Wb, size:CFG.SIZE_BASING,
+          tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))),
+          sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(25, Math.max(10, Math.round(0.75*Wb+5))),
+          stop: stopPx, wantedPct: Math.round(rawW) };
       }
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path)) {
         // cap-aware: W/4 appreciation cap + ~2 days of fees (carries are multi-day)

@@ -55,6 +55,11 @@ async function fetchVolDay(poolAddress, fetchJson) {
     if (isFinite(h) && h > hi) hi = h;
     if (isFinite(l) && l > 0 && l < lo) lo = l;
   }
+  // consolidation floor: lowest low of the recent 5m window (the base being
+  // straddled), distinct from the DAY low which on a crash-then-rally chart can
+  // sit multiples below the current base and make a structural stop unreachable
+  let lo6 = Infinity;
+  for (const c of rvC) { const l = Number(c.low); if (isFinite(l) && l > 0 && l < lo6) lo6 = l; }
   const closeSrc = rvC.length ? rvC : dayC;
   const close = closeSrc.length ? Number(closeSrc[closeSrc.length - 1].close) : NaN;
   const dd = (isFinite(hi) && hi > 0 && isFinite(close)) ? (hi - close) / hi * 100 : null;
@@ -62,6 +67,7 @@ async function fetchVolDay(poolAddress, fetchJson) {
   return {
     rv: computeRealizedVol(rvC),
     dd, pos,
+    low6h: lo6 < Infinity ? lo6 : null,
     low: lo < Infinity ? lo : null,
     close: isFinite(close) ? close : null
   };
