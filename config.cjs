@@ -71,6 +71,7 @@ const CFG = {
   FLOW_PC1:        num('FLOW_PC1', -15),         // ...while 1h price change below this (%)
   OOR_TICKS:       num('OOR_TICKS', 2),          // consecutive out-of-range ticks before exit
   OOR_DEEP_FRAC:   num('OOR_DEEP_FRAC', 0.6),    // out-of-range AND past this fraction of SL -> exit NOW (skip persistence); 0 disables
+  BASING_MAX_FLOOR: num('BASING_MAX_FLOOR', 25), // BASING requires a floor within this %% of price; further away = no tight base, skip
   SQZ_TIMEOUT_H:   num('SQZ_TIMEOUT_H', 24),     // squeeze time-stop (hours, |pnl|<3%)
 
   // TP/SL overrides per class, in % (SL as a POSITIVE number, e.g. 12 means -12%).

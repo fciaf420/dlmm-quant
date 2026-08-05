@@ -219,6 +219,7 @@ async function scan(){
       else if (pc1>0) path="GRIND-UP";
       const audit = t.audit||{};
       let sig = null;
+      let extraBlock = null;   // class-specific rejection reason for the scan log
       // BIN-BUDGET CAP at signal time: deploy clamps width to the 140-bin budget
       // (fine bin steps need ~5x the bins per %%), but brackets were computed from
       // the REQUESTED width - stamping TP/SL for a band that never deploys. Clamp
@@ -249,6 +250,13 @@ async function scan(){
         const px = Number(p.current_price) || 0;
         const floor = (low6h > 0 && low6h < px) ? low6h : ((low > 0 && low < px) ? low : px * 0.85);
         const rawW = px > 0 ? ((px - floor) / px) * 100 : 18;
+        // TIGHT-BASE GATE: a "base" is a level price is chopping ON. If the nearest
+        // consolidation floor is a third of the way down, there is no base to straddle -
+        // the token simply hasn't found one yet. Those are the setups that produced the
+        // -9.95%% and -20.5%% losses (band clamped to its max, structure meaningless).
+        if (rawW > CFG.BASING_MAX_FLOOR) {
+          extraBlock = `no tight base (floor ${rawW.toFixed(0)}%% away > ${CFG.BASING_MAX_FLOOR}%%)`;
+        } else {
         const Wb = Math.min(wCap, Math.min(30, Math.max(8, Math.round(rawW))));
         // stop just under the band bottom = base break confirmed (fast path; OOR-DOWN
         // starts counting the moment price leaves the band)
@@ -260,6 +268,7 @@ async function scan(){
           tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))),
           sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(25, Math.max(10, Math.round(0.75*Wb+5))),
           stop: stopPx, wantedPct: Math.round(rawW) };
+        }
       }
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path)) {
         // cap-aware: W/4 appreciation cap + ~2 days of fees (carries are multi-day)
@@ -274,7 +283,7 @@ async function scan(){
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
           tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0, wantedPct: wantQ };
       }
-      sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}  https://www.meteora.ag/dlmm/${p.address}`);
+      sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+(extraBlock || blocker(edge,p._sg,p._ac,org,path,ageH,ofi))}  https://www.meteora.ag/dlmm/${p.address}`);
       // SHADOW LOG: persist every evaluation (signal or not) for counterfactual replay.
       // Zero extra API calls - this is data already in hand. Review with: node replay.cjs
       try {
