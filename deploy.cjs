@@ -164,6 +164,17 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     }
     record({ funded: false });
     console.log('registered unfunded position (rent recoverable if the add leg fails)');
+    // TRUST-BUT-VERIFY (caught live: SDK v1.9.13's extension ix silently no-op'd,
+    // leaving a 70-bin bottom-anchored band where 139 centered bins were ordered -
+    // the position was born with price on its top edge and 'pumped out' on a +4%
+    // wiggle). Read the account back and refuse to FUND a mis-shaped band. The
+    // unfunded position stays in the registry so its rent is recoverable.
+    const createdPos = await dlmm.getPosition(posKp.publicKey);
+    const gotLo = createdPos.positionData.lowerBinId, gotUp = createdPos.positionData.upperBinId;
+    if (gotLo !== minBinId || gotUp !== maxBinId) {
+      throw new Error(`position created ${gotLo}..${gotUp} but ordered ${minBinId}..${maxBinId} (SDK extension no-op) - refusing to fund a mis-shaped band`);
+    }
+    console.log('verified on-chain bin range matches order:', gotLo, '..', gotUp);
     const addTx = await dlmm.addLiquidityByStrategy({
       positionPubKey: posKp.publicKey, user: user.publicKey,
       totalXAmount: totalX, totalYAmount, strategy, slippage: 3,
