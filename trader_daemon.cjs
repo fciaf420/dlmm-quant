@@ -154,6 +154,7 @@ async function scan(){
   B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
   B.sort((a,b)=>b._fr-a._fr);
   let best = null;
+  const sigs = [];        // all qualifying signals this cycle (bin-aware selection below)
   let degradedSigma = 0;  // legacy-sigma fallbacks on mature (>1h) tokens this cycle
   const cands = B.slice(0, CFG.SCAN_TOP_N);
   hb(`scanning: ${(bd.data||bd).length} pools -> ${B.length} pass tvl/vol -> checking top ${cands.length} by fee rate`);
@@ -214,30 +215,32 @@ async function scan(){
       const binPct = (p.pool_config && p.pool_config.bin_step ? p.pool_config.bin_step : 0) / 100;
       const wCap = binPct > 0 ? Math.floor((CFG.MAX_BINS - 1) / 2) * binPct : 999;
       if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2))) {
-        const Wp = Math.min(wCap, Math.min(30,Math.max(12,Math.round(sigma/4))));
+        const wantP = Math.min(30,Math.max(12,Math.round(sigma/4)));
+        const Wp = Math.min(wCap, wantP);
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
         sig = { label:'IGNITION', mode: ofi>2?'single':'two', widthPct: Wp, size: edge>=2?CFG.SIZE_IGNITION_HI:CFG.SIZE_IGNITION,
           // TP is CAP-AWARE: a two-sided band's max price-driven PnL is exactly W/4
           // (above the band you are 100% SOL); everything beyond is fees. Old min
           // clamp of 8 made low-fee TPs fictional — OOR-UP was doing the real booking.
-          tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0 };
+          tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0, wantedPct: wantP };
       }
       else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5) {
         // cap-aware: W/4 appreciation cap + ~1 day of fees (entry gate requires fr>=15)
         const Wb = Math.min(wCap, 18);
-        sig = { label:'BASING', mode:'two', widthPct:Wb, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(15, Math.max(8, Math.round(0.75*Wb+2))), stop: low?low*0.98:0 };
+        sig = { label:'BASING', mode:'two', widthPct:Wb, size:CFG.SIZE_BASING, tp: CFG.TP_BASING || Math.min(20, Math.max(6, Math.round(Wb/4 + p._fr))), sl: CFG.SL_BASING ? -CFG.SL_BASING : -Math.min(15, Math.max(8, Math.round(0.75*Wb+2))), stop: low?low*0.98:0, wantedPct: 18 };
       }
       else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path)) {
         // cap-aware: W/4 appreciation cap + ~2 days of fees (carries are multi-day)
         const Wc = Math.min(wCap, 35);
-        sig = { label:'CARRY', mode:'two', widthPct:Wc, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(Wc/4 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -Math.min(12, Math.max(8, Math.round(0.75*Wc+2))), stop:0 };
+        sig = { label:'CARRY', mode:'two', widthPct:Wc, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(Wc/4 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -Math.min(12, Math.max(8, Math.round(0.75*Wc+2))), stop:0, wantedPct: 35 };
       }
       else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
-        const Wq = Math.min(wCap, Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4))));
+        const wantQ = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
+        const Wq = Math.min(wCap, wantQ);
         sig = { label:'SQUEEZE', mode:'two', shape:'bidask', widthPct: Wq, size: CFG.SIZE_SQUEEZE,
-          tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0 };
+          tp: CFG.TP_SQUEEZE || Math.min(25, Math.max(5, Math.round(Wq/3 + p._fr*0.5))), sl: CFG.SL_SQUEEZE ? -CFG.SL_SQUEEZE : -Math.min(20, Math.max(8, Math.round(0.7*Wq+2))), stop: 0, wantedPct: wantQ };
       }
       sc(`${n}${sigmaRatio!=null?" sqz "+sigmaRatio.toFixed(2):""} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} accel ${p._ac.toFixed(2)} ofi ${ofi.toFixed(2)}/${ofi6.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${sig ? '=> '+sig.label : '-- '+blocker(edge,p._sg,p._ac,org,path,ageH,ofi)}  https://www.meteora.ag/dlmm/${p.address}`);
       // SHADOW LOG: persist every evaluation (signal or not) for counterfactual replay.
@@ -249,10 +252,25 @@ async function scan(){
           ofi: +ofi.toFixed(2), ofi6: +ofi6.toFixed(2), org: Math.round(org), path, ageH: +ageH.toFixed(1),
           dd: dd != null ? Math.round(dd) : null, sig: sig ? sig.label : null, w: sig ? sig.widthPct : null }) + '\n');
       } catch (e) {}
-      if (sig && !best) best = { p, sig };
+      if (sig) sigs.push({ p, sig });
       await new Promise(r=>setTimeout(r,130));
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
   }
+  // BIN-AWARE SELECTION: the same token often lists 3 pools (20/25/50/100bps) and
+  // the finest bin step usually ranks first by fee rate - but it may not be able to
+  // express the width the data asked for (a +-35 CARRY needs 350 bins at 20bps vs 35
+  // at 100bps). Prefer the pool that can hold the wanted width; candidates arrive in
+  // fee-rate order and Array#sort is stable, so fee rate remains the tiebreak.
+  if (sigs.length) {
+    const ratio = (x) => x.sig.widthPct / (x.sig.wantedPct || x.sig.widthPct);
+    const head = sigs[0];
+    sigs.sort((a, b) => ratio(b) - ratio(a));
+    best = sigs[0];
+    if (best.p.address !== head.p.address) {
+      sc(`bin-aware: preferring ${best.p.name} ${best.p.pool_config?.bin_step}bps (holds ±${best.sig.widthPct}% of ±${best.sig.wantedPct}% wanted) over ${head.p.name} ${head.p.pool_config?.bin_step}bps (only ±${head.sig.widthPct}%)`);
+    }
+  }
+
   // DATA-HEALTH GUARD (mirror of quant-lens v0.6.0 watchdog): if sigma fell back
   // to the legacy estimator on 2+ mature tokens this cycle, candle data is broken
   // and every edge/gate above was computed on a bad instrument. Warn AND refuse
