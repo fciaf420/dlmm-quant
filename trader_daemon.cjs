@@ -85,8 +85,20 @@ async function manage(){
       // OOR tracking: out of range = zero fee income = the vol-selling thesis is dead.
       // 2 consecutive manage ticks (~4 min) filters single-wick noise (same persistence
       // pattern as FEE-DECAY and the squeeze anti-flap).
-      const oor = pos.isOutOfRange === true;
-      const oorDir = oor ? (price > +pos.maxPrice ? 'UP' : 'DOWN') : null;
+      // OOR from OUR OWN registry bin range, not the indexer's flag.
+      // Proven live (CATE, position DXFXNbWC): the create tx ran InitializePosition
+      // (base 70 bins) + IncreasePositionLength(69, Upper) - both succeeded, so the
+      // on-chain band was the full 139 bins - but the datapi rollup reports only the
+      // BASE width (-679..-610), so price sitting in the healthy UPPER HALF of the
+      // real band was flagged isOutOfRange and the daemon exited a fine position.
+      // poolActiveBinId is pool state (reliable); minBinId/maxBinId are what we
+      // actually ordered and verified. Fall back to the flag for pre-fix rows.
+      const activeBin = Number(pos.poolActiveBinId);
+      const haveBins = Number.isFinite(activeBin) && Number.isFinite(p.minBinId) && Number.isFinite(p.maxBinId);
+      const oor = haveBins ? (activeBin < p.minBinId || activeBin > p.maxBinId) : pos.isOutOfRange === true;
+      const oorDir = !oor ? null
+        : haveBins ? (activeBin > p.maxBinId ? 'UP' : 'DOWN')
+        : (price > +pos.maxPrice ? 'UP' : 'DOWN');
       s.oorTicks = s.oorTicks || {};
       s.oorTicks[p.pool] = oor ? (s.oorTicks[p.pool] || 0) + 1 : 0;
       const pool = await jget(`${MET}/pools/${p.pool}`);
