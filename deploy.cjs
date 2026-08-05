@@ -93,6 +93,11 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   if (swapSOL > 0) {
     const amt = Math.floor(swapSOL*1e9);
     let ok = false;
+    // Jupiter rate-limit retry (caught live: a deploy died in 1s on
+    // {"code":429,"message":"[API Gateway] Too many requests"} - the CLI's 10-min
+    // scans and the extension radar's 3-min polls share one API key). Nothing has
+    // been signed or sent at this point, so retrying is free; back off between tries.
+    for (let sAttempt = 1; sAttempt <= 3 && !ok; sAttempt++) {
     try {
       const ord = await (await fetch(`https://api.jup.ag/swap/v2/order?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&taker=${user.publicKey.toBase58()}`, { headers:{'x-api-key':JK} })).json();
       if (ord.transaction) {
@@ -106,11 +111,22 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${SOLM}&outputMint=${MINT}&amount=${amt}&slippageBps=${CFG.SLIPPAGE_BPS}`, { headers:{'x-api-key':JK} })).json();
       const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
         body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
-      // Without this the failure surfaces as a bare "Buffer.from received undefined".
-      if (!sw.swapTransaction) throw new Error(`jupiter v1 swap returned no transaction: ${JSON.stringify(sw.error||q.error||sw).slice(0,200)}`);
+      if (!sw.swapTransaction) {
+        const why = JSON.stringify(sw.error||q.error||sw).slice(0,200);
+        if (sAttempt < 3 && /429|too many requests|rate/i.test(why)) {
+          const backoff = sAttempt * 4000;
+          console.log(`jupiter rate-limited (attempt ${sAttempt}/3) - backing off ${backoff/1000}s`);
+          await new Promise(r=>setTimeout(r, backoff));
+          continue;
+        }
+        // Without this the failure surfaces as a bare "Buffer.from received undefined".
+        throw new Error(`jupiter v1 swap returned no transaction: ${why}`);
+      }
       const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
       const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
       await confirmSig(conn, sig, 'swap v1'); console.log('swap v1:', sig);
+      ok = true;
+    }
     }
     // RPC-visibility race (caught live 2026-08-03, MENSA deploy): Jupiter's 'Success'
     // can lead our RPC node's view by several seconds. Poll for the DELTA over the
