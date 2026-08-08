@@ -224,6 +224,11 @@ async function scan(){
       // here so brackets derive from the width that actually ships.
       const binPct = (p.pool_config && p.pool_config.bin_step ? p.pool_config.bin_step : 0) / 100;
       const wCap = binPct > 0 ? Math.floor((CFG.MAX_BINS - 1) / 2) * binPct : 999;
+      // floor distance computed for EVERY candidate (not just BASING) so the shadow
+      // log can replay tight-base counterfactuals offline; pure function, BASING
+      // branch consumes the same values below.
+      const px = Number(p.current_price) || 0;
+      const { rawW } = GATES.basingFloor({ px, low, low6h });
       if (GATES.ignition({ edge, sg:p._sg, ac:p._ac, org, path, ageH, ofi })) {
         const wantP = Math.min(30,Math.max(12,Math.round(sigma/4)));
         const Wp = Math.min(wCap, wantP);
@@ -245,8 +250,7 @@ async function scan(){
         // -78%%), so the structural stop could never fire - the PnL SL and OOR-DOWN, ~2
         // points of price apart, did all the work. Three loss rules, two duplicated, one
         // dead, none expressing the actual thesis.
-        const px = Number(p.current_price) || 0;
-        const { rawW } = GATES.basingFloor({ px, low, low6h });
+        // px / rawW computed above (hoisted for the shadow log)
         // TIGHT-BASE GATE: a "base" is a level price is chopping ON. If the nearest
         // consolidation floor is a third of the way down, there is no base to straddle -
         // the token simply hasn't found one yet. Those are the setups that produced the
@@ -288,7 +292,15 @@ async function scan(){
           tvl: Math.round(p.tvl || 0), fr: +p._fr.toFixed(2), sg: +p._sg.toFixed(2), ac: +p._ac.toFixed(2),
           sigma: +sigma.toFixed(1), src: rv != null ? 'rv' : 'lg', edge: +edge.toFixed(3),
           ofi: +ofi.toFixed(2), ofi6: +ofi6.toFixed(2), org: Math.round(org), path, ageH: +ageH.toFixed(1),
-          dd: dd != null ? Math.round(dd) : null, sig: sig ? sig.label : null, w: sig ? sig.widthPct : null }) + '\n');
+          dd: dd != null ? Math.round(dd) : null, sig: sig ? sig.label : null, w: sig ? sig.widthPct : null,
+          // widened 2026-08-08: every gate INPUT now persists, so rule variants can be
+          // tested offline. Before this, squeeze ratios lived only in daemon_state's
+          // rolling 40-entry window — the best-performing class had the least data —
+          // and rawW/pos/pc5/pc1 weren't logged at all (tight-base and path boundaries
+          // were untestable in replay).
+          pc5: +pc5.toFixed(1), pc1: +pc1.toFixed(1), pos: pos != null ? +pos.toFixed(2) : null,
+          px, rawW: +rawW.toFixed(1), sqzR: sigmaRatio != null ? +sigmaRatio.toFixed(2) : null,
+          sqzP: sqzPersist ? 1 : 0, binStep: p.pool_config?.bin_step ?? null }) + '\n');
       } catch (e) {}
       if (sig) sigs.push({ p, sig });
       await new Promise(r=>setTimeout(r,130));
