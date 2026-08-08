@@ -25,6 +25,8 @@ const { confirmSig } = require('./sendtx.cjs');
     const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amount}&slippageBps=300`, { headers:{'x-api-key':JK} })).json();
     const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
       body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
+    // Without this a 429 error body surfaces as a bare "Buffer.from received undefined" (mirror of deploy.cjs fix)
+    if (!sw.swapTransaction) throw new Error(`jupiter v1 swap returned no transaction: ${JSON.stringify(sw.error||q.error||sw).slice(0,200)}`);
     const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64'));
     tx.sign([user]);
     const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });

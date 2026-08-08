@@ -33,7 +33,17 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avo
   const accs = await conn.getParsedTokenAccountsByOwner(user.publicKey, { mint: new PublicKey(MINT) });
   const raw = accs.value.reduce((s,a)=>s + Number(a.account.data.parsed.info.tokenAmount.amount), 0);
   if (raw > 0) {
+    // SWEEP MUST NOT KILL THE EXIT (audit 2026-08-08): the position is already closed
+    // on-chain by this point. The old code threw on any sweep failure (incl. a bare
+    // "Buffer.from received undefined" on a Jupiter 429 - the null-check deploy.cjs
+    // got after being caught live never made it here), which aborted BEFORE the
+    // registry write; next tick manage() saw totalCount 0, took the EXTERNAL-CLOSE
+    // branch, dropped the row with a null journal, and the tokens sat in the wallet
+    // silently. Now: retry with backoff, and on final failure WARN + finish the
+    // bookkeeping - the daemon surfaces the SWEEP FAILED line, manual recovery is
+    // node jupswap.cjs <mint> <SOL> <raw>.
     let ok = false;
+    for (let sAttempt = 1; sAttempt <= 3 && !ok; sAttempt++) {
     try {
       const ord = await (await fetch(`https://api.jup.ag/swap/v2/order?inputMint=${MINT}&outputMint=${SOLM}&amount=${raw}&taker=${user.publicKey.toBase58()}`, { headers:{'x-api-key':JK} })).json();
       if (ord.transaction) {
@@ -42,15 +52,23 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing exit to avo
           body: JSON.stringify({ signedTransaction: Buffer.from(tx.serialize()).toString('base64'), requestId: ord.requestId }) })).json();
         ok = ex.status === 'Success'; console.log('sweep v2:', ex.status);
       }
-    } catch(e){}
+    } catch(e){ console.log('sweep v2 err:', e.message); }
     if (!ok) {
-      const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${MINT}&outputMint=${SOLM}&amount=${raw}&slippageBps=${CFG.SLIPPAGE_BPS}`, { headers:{'x-api-key':JK} })).json();
-      const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
-        body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
-      const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
-      const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
-      await confirmSig(conn, sig, 'sweep v1'); console.log('sweep v1:', sig);
+      try {
+        const q = await (await fetch(`https://api.jup.ag/swap/v1/quote?inputMint=${MINT}&outputMint=${SOLM}&amount=${raw}&slippageBps=${CFG.SLIPPAGE_BPS}`, { headers:{'x-api-key':JK} })).json();
+        const sw = await (await fetch('https://api.jup.ag/swap/v1/swap', { method:'POST', headers:{'x-api-key':JK,'content-type':'application/json'},
+          body: JSON.stringify({ quoteResponse: q, userPublicKey: user.publicKey.toBase58(), wrapAndUnwrapSol: true }) })).json();
+        if (!sw.swapTransaction) throw new Error(`jupiter v1 sweep returned no transaction: ${JSON.stringify(sw.error||q.error||sw).slice(0,200)}`);
+        const tx = VersionedTransaction.deserialize(Buffer.from(sw.swapTransaction,'base64')); tx.sign([user]);
+        const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries:3 });
+        await confirmSig(conn, sig, 'sweep v1'); console.log('sweep v1:', sig); ok = true;
+      } catch(e){
+        console.log(`sweep v1 err (attempt ${sAttempt}/3): ${e.message}`);
+        if (sAttempt < 3) await new Promise(r=>setTimeout(r, sAttempt*4000));
+      }
     }
+    }
+    if (!ok) console.log(`SWEEP FAILED after 3 attempts - ${raw} raw of ${MINT} left in wallet; recover with: node jupswap.cjs ${MINT} ${SOLM} ${raw}`);
   }
   fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg.filter(r=>r.pool!==POOL), null, 1));
   const sol = await conn.getBalance(user.publicKey);
