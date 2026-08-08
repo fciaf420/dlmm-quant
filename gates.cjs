@@ -21,13 +21,13 @@ const edgeFrom = (fr, sigma) => ((fr*0.9)/Math.max(sigma,.001)) / Math.max(1.3*s
 const ignition = ({ edge, sg, ac, org, path, ageH, ofi }) =>
   edge>=1.0 && sg>=1.25 && ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2));
 
-// edge floor raised 0.5 -> 1.0 (2026-08-08). The 0.5 discount assumed the post-crash
-// lookback inflates sigma and understates edge; live it admitted serial floor-breakers:
-// replay's 0.5-1 bucket ran -4.5% (n=34) and BUTTHOLE alone took -8.9/-8.6/-8.8 on
-// BASING entries at edge 0.66/0.83/0.97 in three days. fr>=15 did not save them -
-// a landing in a stair-step decline has great fees right up until the floor gives.
+// edge floor raised 0.5 -> 0.8 (2026-08-08). The 0.5 discount assumed the post-crash
+// lookback inflates sigma and understates edge; live it admitted serial floor-breakers
+// (BUTTHOLE: -8.9/-8.6 on BASING entries in three days - a landing in a stair-step
+// decline has great fees right up until the floor gives). Replay splits the old
+// 0.5-1 bucket cleanly at 0.8: 0.5-0.8 = -6.1% (n=27), 0.8-1.0 = +1.9% (5/7 wins).
 const basing = ({ path, ofi, org, fr, edge }) =>
-  path==="BASING" && ofi<=1.0 && org>=60 && fr>=15 && edge>=1.0;
+  path==="BASING" && ofi<=1.0 && org>=60 && fr>=15 && edge>=0.8;
 
 // BASE-ANCHORED floor: nearest consolidation low below price (6h preferred, then
 // 24h, then a synthetic -15%). rawW = how far below price that floor sits, in %.
