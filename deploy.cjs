@@ -92,6 +92,13 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   } catch(e){}
   if (swapSOL > 0) {
     const amt = Math.floor(swapSOL*1e9);
+    // PRE-JOURNAL (audit 2026-08-08): the ledger used to be written only AFTER the
+    // 30s delta poll - a hard kill (kill -9 / power loss) between Jupiter 'Success'
+    // and that write left no ledger, so the retry's preRaw included the bought tokens,
+    // reuse never triggered, and the leg re-swapped: a double-buy. Journal the baseline
+    // BEFORE sending; the reuse condition (preRaw > pd.preRaw) ignores a journal whose
+    // swap never landed, so pre-journaling is strictly safer. Consumed at record().
+    try { fs.writeFileSync(PEND, JSON.stringify({ mint: MINT, preRaw, swapSOL, ts: Date.now() })); } catch(e){}
     let ok = false;
     // Jupiter rate-limit retry (caught live: a deploy died in 1s on
     // {"code":429,"message":"[API Gateway] Too many requests"} - the CLI's 10-min
@@ -139,17 +146,15 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
       console.log('swap output not visible yet, retry ' + (i+1) + '/12');
     }
     if (delta <= 0) {
-      // swap likely landed but our node is behind: journal the baseline so the
-      // RETRY reuses exactly what this attempt bought once it becomes visible
-      try { fs.writeFileSync(PEND, JSON.stringify({ mint: MINT, preRaw, swapSOL, ts: Date.now() })); } catch(e){}
+      // swap likely landed but our node is behind: the PRE-JOURNALED baseline means
+      // the RETRY reuses exactly what this attempt bought once it becomes visible
       throw new Error('swap output not visible after 30s - aborting; baseline journaled, retry reuses the exact delta');
     }
     totalX = new BN(String(delta));
     console.log('token acquired (exact swap delta, raw):', delta);
-    // journal the swap output NOW: if anything after this fails (e.g. position-open
-    // blockhash expiry - caught live), the retry reuses this exact delta instead of
-    // swapping again and stranding the first buy
-    try { fs.writeFileSync(PEND, JSON.stringify({ mint: MINT, preRaw, swapSOL, ts: Date.now() })); } catch(e){}
+    // baseline already journaled pre-send: if anything after this fails (e.g.
+    // position-open blockhash expiry - caught live), the retry reuses this exact
+    // delta instead of swapping again and stranding the first buy
   }
   if (mode === 'two' && totalX.isZero()) throw new Error('two-sided deploy with zero token side - refusing to open a mislabeled one-sided position');
   const solSide = mode === 'two' ? size/2 : size;
