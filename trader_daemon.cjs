@@ -4,6 +4,7 @@ const fs = require('fs'); const { execFileSync } = require('child_process');
 const DIR = __dirname;
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
 const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
+const GATES = require("./gates.cjs");   // shared with screen.cjs — edit gates THERE, not inline
 const SOLM = CFG.QUOTE_MINT;
 const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
@@ -43,6 +44,7 @@ const hb = (m) => { console.log(`${new Date().toTimeString().slice(0,8)} ${m}`);
 // shows what's being evaluated instead of sitting silent for ~15s.
 const sc = (m) => { console.log(`         ${m}`); log(m); };
 // First gate a candidate fails, so a rejection is legible at a glance.
+// (log text only — thresholds mirror gates.cjs ignition(); keep in sync when tuning)
 function blocker(edge, sg, ac, org, path, ageH, ofi){
   if (path === 'FREEFALL') return 'FREEFALL';
   if (edge < 1.0)  return `edge ${edge.toFixed(2)}<1.0`;
@@ -187,7 +189,7 @@ async function scan(){
       try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
       if (rv == null && ageH > 1) degradedSigma++;  // candles should exist for a >1h token
-      const edge = ((p._fr*0.9)/Math.max(sigma,.001)) / Math.max(1.3*sigma/160,.001);
+      const edge = GATES.edgeFrom(p._fr, sigma);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
       const org = t.organicScore||0;
@@ -212,11 +214,7 @@ async function scan(){
           sqzPersist = (sigmaRatio <= 0.6 && prevRatio != null && prevRatio <= 0.6);  // 2 consecutive scans
         } }
 
-      let path="CHOP";
-      if (pc1<=-25 || (pc5<=-8 && pc1<0)) path="FREEFALL";
-      else if ((dd??0)>=40 && Math.abs(pc5)<5 && pc1>-15) path="BASING";
-      else if ((pos??0)>0.85 && pc1>40) path="BLOWOFF";
-      else if (pc1>0) path="GRIND-UP";
+      const path = GATES.classifyPath({ pc5, pc1, dd, pos });
       const audit = t.audit||{};
       let sig = null;
       let extraBlock = null;   // class-specific rejection reason for the scan log
@@ -226,7 +224,7 @@ async function scan(){
       // here so brackets derive from the width that actually ships.
       const binPct = (p.pool_config && p.pool_config.bin_step ? p.pool_config.bin_step : 0) / 100;
       const wCap = binPct > 0 ? Math.floor((CFG.MAX_BINS - 1) / 2) * binPct : 999;
-      if (edge>=1.0 && p._sg>=1.25 && p._ac>=1.2 && org>=40 && path!=="FREEFALL" && (ageH>=6 || (org>=60 && ofi<2))) {
+      if (GATES.ignition({ edge, sg:p._sg, ac:p._ac, org, path, ageH, ofi })) {
         const wantP = Math.min(30,Math.max(12,Math.round(sigma/4)));
         const Wp = Math.min(wCap, wantP);
         // TP = capped appreciation (W/4) + ~half-day fee take; SL = just inside structural band-break (~-0.75W).
@@ -236,7 +234,7 @@ async function scan(){
           // clamp of 8 made low-fee TPs fictional — OOR-UP was doing the real booking.
           tp: CFG.TP_IGNITION || Math.min(25,Math.max(4,Math.round(Wp/4 + p._fr*0.5))), sl: CFG.SL_IGNITION ? -CFG.SL_IGNITION : -Math.min(20,Math.max(8,Math.round(0.75*Wp+2))), stop: 0, wantedPct: wantP };
       }
-      else if (path==="BASING" && ofi<=1.0 && org>=60 && p._fr>=15 && edge>=0.5) {
+      else if (GATES.basing({ path, ofi, org, fr:p._fr, edge })) {
         // BASE-ANCHORED BAND: the class thesis is "price is chopping on a floor" - so the
         // band's BOTTOM is placed AT that floor (recent consolidation low). Then leaving
         // the band downward IS the base breaking: OOR-DOWN and the structural stop finally
@@ -248,8 +246,7 @@ async function scan(){
         // points of price apart, did all the work. Three loss rules, two duplicated, one
         // dead, none expressing the actual thesis.
         const px = Number(p.current_price) || 0;
-        const floor = (low6h > 0 && low6h < px) ? low6h : ((low > 0 && low < px) ? low : px * 0.85);
-        const rawW = px > 0 ? ((px - floor) / px) * 100 : 18;
+        const { rawW } = GATES.basingFloor({ px, low, low6h });
         // TIGHT-BASE GATE: a "base" is a level price is chopping ON. If the nearest
         // consolidation floor is a third of the way down, there is no base to straddle -
         // the token simply hasn't found one yet. Those are the setups that produced the
@@ -270,12 +267,12 @@ async function scan(){
           stop: stopPx, wantedPct: Math.round(rawW) };
         }
       }
-      else if (edge>=1.3 && ofi6<1.0 && org>=60 && (p.tvl||0)>=100000 && (p._fr>=2 || (p._fr>=1.2 && edge>=2) || (p._fr>=0.6 && edge>=3 && sigma<10)) && ageH>=72 && audit.mintAuthorityDisabled===true && audit.freezeAuthorityDisabled===true && ["CHOP","BASING","GRIND-UP"].includes(path)) {
+      else if (GATES.carry({ edge, ofi6, org, tvl:p.tvl, fr:p._fr, sigma, ageH, audit, path })) {
         // cap-aware: W/4 appreciation cap + ~2 days of fees (carries are multi-day)
         const Wc = Math.min(wCap, 35);
         sig = { label:'CARRY', mode:'two', widthPct:Wc, size:CFG.SIZE_CARRY, tp: CFG.TP_CARRY || Math.min(15, Math.max(6, Math.round(Wc/4 + p._fr*2))), sl: CFG.SL_CARRY ? -CFG.SL_CARRY : -Math.min(12, Math.max(8, Math.round(0.75*Wc+2))), stop:0, wantedPct: 35 };
       }
-      else if (sqzPersist && path === "CHOP" && (pos == null || (pos >= 0.35 && pos <= 0.65)) && ofi >= 0.5 && ofi <= 2 && org >= 60 && ageH >= 24 && (p.tvl||0) >= 80000 && p._fr >= 1) {
+      else if (GATES.squeeze({ sqzPersist, path, pos, ofi, org, ageH, tvl:p.tvl, fr:p._fr })) {
         // SQUEEZE (long-vol wing): sigma compressed to <=60% of its own trailing median.
         // DATA-GATED: cannot fire without >=6 prior readings spanning >=45min. Width from the TRAILING sigma (what it coils back to).
         const wantQ = Math.min(30, Math.max(15, Math.round((sigmaTrail||60) / 4)));
