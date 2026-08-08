@@ -76,9 +76,21 @@ async function manage(){
     try {
       const pnl = await jget(`${MET}/positions/${p.pool}/pnl?user=${WALLET}&status=open`);
       if (!pnl.totalCount) {
-        ev(`EXTERNAL CLOSE detected ${p.name} — removing from registry`);
+        // CLEANUP SWEEP (audit 2026-08-08): reaching here with a registry row means a
+        // manual UI close OR an exit that crashed after the on-chain close but before
+        // its sweep. The old code dropped the row with a null journal and left any
+        // unswept tokens sitting in the wallet silently. exit.cjs is idempotent - its
+        // close loop no-ops on an already-closed position, its sweep clears residue -
+        // so run it before dropping the row, and journal the real wallet balance.
+        let fin = null;
+        try {
+          const out = execFileSync(NODE, [DIR+'/exit.cjs','--pool',p.pool], { cwd: DIR, timeout: 480e3 }).toString();
+          fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
+          if (/SWEEP FAILED/.test(out)) ev(`SWEEP FAILED in external-close cleanup ${p.name} — recover manually (see daemon.log)`);
+        } catch(e){ log(`external-close cleanup err ${p.name}: ${String(e.message).slice(0,150)}`); }
+        ev(`EXTERNAL CLOSE detected ${p.name} — swept residue, removing from registry${fin?` | wallet ${fin} SOL`:''}`);
         if (s.oorTicks) delete s.oorTicks[p.pool];
-        journalTrade(p, 'EXTERNAL', null, null);
+        journalTrade(p, 'EXTERNAL', null, fin ? +fin : null);
         fs.writeFileSync(DIR+'/positions.json', JSON.stringify(reg().filter(r=>r.pool!==p.pool),null,1));
         continue;
       }
@@ -142,6 +154,7 @@ async function manage(){
         try {
           const out = execFileSync(NODE, [DIR+'/exit.cjs','--pool',p.pool], { cwd: DIR, timeout: 480e3 }).toString();
           const fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
+          if (/SWEEP FAILED/.test(out)) ev(`SWEEP FAILED on ${p.name} exit — tokens left in wallet, recover manually (see daemon.log)`);
           s.cooldowns[p.pool] = Date.now();
           if (s.oorTicks) delete s.oorTicks[p.pool];
           journalTrade(p, trigger, +pnlPct.toFixed(2), fin ? +fin : null);
@@ -189,6 +202,11 @@ async function scan(){
       try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
       if (rv == null && ageH > 1) degradedSigma++;  // candles should exist for a >1h token
+      // MIN_SIGMA universe gate (audit 2026-08-08): edge = fr/sigma^2, so an LST/stable-
+      // grade asset prints fictional thousand-edges on pools that yield nothing (INF-SOL
+      // was in the live top-100). Also: flat candles return rv=0, which BYPASSES the
+      // degraded-sigma watchdog above (it checks null, not 0) - this gate closes that too.
+      if (sigma < CFG.MIN_SIGMA) { sc(`${n} skip: sigma ${sigma.toFixed(1)}<${CFG.MIN_SIGMA} - vol too low, edge unreliable`); continue; }
       const edge = GATES.edgeFrom(p._fr, sigma);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);

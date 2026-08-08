@@ -48,6 +48,12 @@ const CFG = {
   // candidate universe
   MIN_TVL:      num('MIN_TVL', 60000),
   MIN_VOL_24H:  num('MIN_VOL_24H', 150000),
+  // Hard vol floor for candidates. edge = fr/sigma^2, so a low-sigma asset (LST,
+  // stable, wrapped major - INF-SOL sat in the live top-100 during the 2026-08-08
+  // audit) prints fictional thousand-edges on pools that yield nothing. Also closes
+  // a watchdog hole: flat candles return rv=0, which BYPASSES the degraded-sigma
+  // guard (it checks rv==null, not 0). Real memecoin candidates run 30-500%%/day.
+  MIN_SIGMA:    num('MIN_SIGMA', 5),
   SCAN_TOP_N:   num('SCAN_TOP_N', 8),       // candidates examined per scan, by fee rate
   COOLDOWN_H:   num('COOLDOWN_H', 2),       // hours before re-entering a pool after exit
 

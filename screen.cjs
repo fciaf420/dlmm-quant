@@ -31,6 +31,8 @@ const fs = require("fs");
       let dd=null, pos=null, low=null, low6h=null, rv=null;
       try { const vd = await fetchVolDay(p.address); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);   // RV primary, legacy fallback
+      // MIN_SIGMA universe gate - keep in sync with trader_daemon.cjs scan()
+      if (sigma < CFG.MIN_SIGMA) continue;
       const edge = GATES.edgeFrom(p._fr, sigma);
       const path = GATES.classifyPath({ pc5, pc1, dd, pos });
       // squeeze persistence: last two same-source ratios the daemon recorded, both <= 0.6
