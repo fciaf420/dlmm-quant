@@ -40,6 +40,11 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
     process.exit(6);
   }
   const MINT = pool.token_x.address;
+  // MINT DEDUP (caught live 2026-08-08: two BASING positions opened on Jimothy via
+  // different pools - same token, double the risk, both slots of the 2-position cap
+  // burned on one thesis). The pool-keyed check above can't see sibling pools of the
+  // same token; this one can. Same exit code as the pool dup.
+  if (reg0.find(r => r.mint === MINT)) { console.error('DUPLICATE: token already held via another pool'); process.exit(4); }
   const binStepPct = pool.pool_config.bin_step / 100;
   // Position sizing. initializePositionAndAddLiquidityByStrategy creates the account via
   // CPI, so it can only cover DEFAULT_BIN_PER_POSITION (70) bins before the account

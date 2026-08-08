@@ -156,6 +156,7 @@ async function manage(){
           const fin = out.match(/FINAL wallet SOL: ([\d.]+)/)?.[1];
           if (/SWEEP FAILED/.test(out)) ev(`SWEEP FAILED on ${p.name} exit — tokens left in wallet, recover manually (see daemon.log)`);
           s.cooldowns[p.pool] = Date.now();
+          if (p.mint) s.cooldowns[p.mint] = Date.now();   // mint-keyed too: blocks sibling-pool re-entry
           if (s.oorTicks) delete s.oorTicks[p.pool];
           journalTrade(p, trigger, +pnlPct.toFixed(2), fin ? +fin : null);
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
@@ -186,11 +187,16 @@ async function scan(){
   hb(`scanning: ${(bd.data||bd).length} pools -> ${B.length} pass tvl/vol -> checking top ${cands.length} by fee rate`);
   for (const [i, p] of cands.entries()) {
     const n = `${i+1}/${cands.length} ${(p.name||'?').padEnd(16).slice(0,16)}`;
-    if (positions.find(r=>r.pool===p.address)) { sc(`${n} skip: already holding`); continue; }
-    if (s.cooldowns[p.address] && Date.now()-s.cooldowns[p.address] < CFG.COOLDOWN_H*3600e3) {
-      const mins = Math.round((CFG.COOLDOWN_H*3600e3 - (Date.now()-s.cooldowns[p.address]))/60e3);
-      sc(`${n} skip: cooldown ${mins}m left`); continue;
-    }
+    // MINT DEDUP (caught live 2026-08-08: two BASING positions on Jimothy via different
+    // pools - same token risk doubled inside the 2-slot cap). Skip by pool OR token.
+    if (positions.find(r=>r.pool===p.address || r.mint===p.token_x.address)) { sc(`${n} skip: already holding (pool or token)`); continue; }
+    // cooldown is keyed by pool AND mint - exiting a token blocks re-entry via ANY of
+    // its sibling pools, not just the one just exited (same incident as the dedup).
+    { const cdTs = Math.max(s.cooldowns[p.address]||0, s.cooldowns[p.token_x.address]||0);
+      if (cdTs && Date.now()-cdTs < CFG.COOLDOWN_H*3600e3) {
+        const mins = Math.round((CFG.COOLDOWN_H*3600e3 - (Date.now()-cdTs))/60e3);
+        sc(`${n} skip: cooldown ${mins}m left`); continue;
+      } }
     try {
       const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${p.token_x.address}`, true);
       const t = Array.isArray(tk)?tk[0]:null; if(!t) continue;
