@@ -9,12 +9,18 @@
     "deploy": "node deploy.cjs",
     "exit": "node exit.cjs",
     "bins": "node binscore.cjs",
-    "swap": "node jupswap.cjs"
+    "swap": "node jupswap.cjs",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.5.4",
     "@solana/web3.js": "^1.95.3",
-    "bs58": "^6.0.0",
-    "bn.js": "^5.2.1"
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.1",
+    "globals": "^17.9.0"
   }
 }
