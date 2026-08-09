@@ -3,12 +3,15 @@
 //
 // usage (give whichever PnL flavor the card shows — cards toggle $/% and USD/SOL):
 //   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --baseFee 2 --duration 7:28 --pnl 17.17
-//   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --duration 7:28 --pnlUsd 63.54
-//   node pnlhunt.cjs --pool <ADDR> --duration 7:28 --pnlSolPct 17.17     # "PNL (SOL) +17.17%"
-//   flags: --pnl (USD %)  --pnlSolPct (SOL %)  --pnlUsd ($)  --pnlSol (SOL amount)  [--pages 250] [--tol 4]
+//   node pnlhunt.cjs --pair STONK-SOL  --binStep 50  --baseFee 0.5 --duration 9:54:46 --pnl 1.38
+//   flags: --pnl (the card's "PNL %")  --pnlUsd ($)  --profitSol (card "PROFIT (SOL)")  --pnlSolPct (rare)  [--pages 250] [--tol 6]
 //
-// A card always shows hold duration (hh:mm:ss) + one PnL number in one of four flavors.
-// Duration + any single PnL flavor to ~2dp is effectively a unique fingerprint. Pipeline:
+// FIELD MAP (learned from real cards — metlex/RocketScan use a USD basis):
+//   card "PNL  +X%"        -> datapi pnlPctChange   (ALWAYS USD %, even when PROFIT is labeled SOL)  -> --pnl
+//   card "PROFIT (USD) $X" -> datapi pnlUsd                                                          -> --pnlUsd
+//   card "PROFIT (SOL) X"  -> pnlUsd / SOL_price  (USD pnl expressed in SOL)                         -> --profitSol
+// The bottom-bar "PNL %" is the most reliable single anchor. Pair it with --duration.
+// Duration + the PNL% to ~2dp is effectively a unique fingerprint. Pipeline:
 //   1. resolve the pool  (on-chain getProgramAccounts by token mint + bin step; deterministic)
 //   2. cheap pass: check CURRENTLY-OPEN positions (card shared while still open)
 //   3. walk INITIALIZE_POSITION events newest-first; per position, on-chain sigs give
@@ -61,13 +64,17 @@ async function resolvePool() {
 // relative tolerance (card rounding); percentages match on absolute tolerance.
 function pnlTargets() {
   const T = [];
-  if (arg('pnl')       != null) T.push({ field:'pnlPctChange',    v:+arg('pnl'),       abs:0.3,  label:'USD%' });
-  if (arg('pnlSolPct') != null) T.push({ field:'pnlSolPctChange', v:+arg('pnlSolPct'), abs:0.3,  label:'SOL%' });
-  if (arg('pnlUsd')    != null) T.push({ field:'pnlUsd',          v:+arg('pnlUsd'),    rel:0.02, label:'$'   });
-  if (arg('pnlSol')    != null) T.push({ field:'pnlSol',          v:+arg('pnlSol'),    rel:0.02, label:'SOL' });
+  if (arg('pnl')       != null) T.push({ field:'pnlPctChange',    v:+arg('pnl'),       abs:0.3,  label:'PNL%' });  // card "PNL %" (USD basis)
+  if (arg('pnlUsd')    != null) T.push({ field:'pnlUsd',          v:+arg('pnlUsd'),    rel:0.03, label:'$'    });  // card "PROFIT (USD)"
+  if (arg('pnlSolPct') != null) T.push({ field:'pnlSolPctChange', v:+arg('pnlSolPct'), abs:0.3,  label:'SOL%' });  // rare
+  if (arg('pnlSol')    != null) T.push({ field:'pnlSol',          v:+arg('pnlSol'),    rel:0.03, label:'SOLnet' });
+  // card "PROFIT (SOL)" = pnlUsd / SOL_price. We don't have SOL_price offline, so match
+  // pnlUsd within a wide band consistent with SOL ~$60-260 (profitSol * price).
+  if (arg('profitSol') != null) T.push({ field:'pnlUsd', v:+arg('profitSol'), lo:+arg('profitSol')*60, hi:+arg('profitSol')*260, label:'profitSOL' });
   return T;
 }
-const pnlMatch = (row, T) => T.every(t => t.abs != null ? Math.abs(+row[t.field]-t.v) <= t.abs
+const pnlMatch = (row, T) => T.every(t => t.lo != null ? (+row[t.field] >= t.lo && +row[t.field] <= t.hi)
+                                        : t.abs != null ? Math.abs(+row[t.field]-t.v) <= t.abs
                                                         : Math.abs(+row[t.field]-t.v) <= Math.max(t.rel*Math.abs(t.v), 0.01));
 const pnlShow = (row, T) => (T.length?T:[{field:'pnlPctChange',label:'USD%'}]).map(t=>`${t.label} ${(+row[t.field]).toFixed(2)}`).join(' / ');
 
@@ -113,12 +120,16 @@ const pnlShow = (row, T) => (T.length?T:[{field:'pnlPctChange',label:'USD%'}]).m
       if (stillOpen) continue;
       const dur = closeT - openT; checked++;
       if (Math.abs(dur - targetSec) > tol) continue;
-      // duration matches — confirm PnL via datapi (owner's closed positions)
+      // duration matches — pull the owner's closed rows and find THIS position's row
       const cr = await jget(`${DATAPI}/positions/${pool}/pnl?user=${owner}&status=closed`);
       const crows = (cr.positions||[]).map(p => ({ ...p, dur:(p.closedAt&&p.createdAt)?p.closedAt-p.createdAt:null }));
-      const m = crows.find(x => x.dur!=null && Math.abs(x.dur-targetSec)<=tol && (!T.length || pnlMatch(x, T)));
-      if (m) { console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${owner}\n  position ${position}\n  duration ${secToDur(m.dur)}  pnl ${pnlShow(m, T)}\n  https://solscan.io/account/${owner}`); hits++; }
-      else console.log(`  dur-match ${secToDur(dur)} owner ${owner.slice(0,6)}… pnl no-confirm (${crows.map(x=>pnlShow(x,T)).join(' | ')||'no closed rows'})`);
+      const row = crows.find(x => x.positionAddress===position) || crows.find(x => x.dur!=null && Math.abs(x.dur-targetSec)<=tol);
+      const feeSol = (() => { try { return +JSON.parse(row.allTimeFees||'{}').tokenY?.amount || (row.allTimeFees?.tokenY?.amount); } catch { return row?.allTimeFees?.tokenY?.amount; } })();
+      const depSol = (() => { try { const d=typeof row.allTimeDeposits==='string'?JSON.parse(row.allTimeDeposits):row.allTimeDeposits; return d?.tokenY?.amount; } catch { return null; } })();
+      const info = row ? `dur ${secToDur(row.dur)} | pnlSol ${(+row.pnlSol).toFixed(3)} (${(+row.pnlSolPctChange).toFixed(2)}%) | feesSOL ${feeSol!=null?(+feeSol).toFixed(2):'?'} | depositSOL ${depSol!=null?(+depSol).toFixed(1):'?'} | entryPx ${row.minPrice||row.entryPrice||'?'}` : 'no row';
+      const pnlOk = row && (!T.length || pnlMatch(row, T));
+      if (pnlOk) { console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${owner}\n  position ${position}\n  ${info}\n  https://solscan.io/account/${owner}`); hits++; }
+      else console.log(`  DUR-MATCH ${secToDur(dur)} owner ${owner} position ${position} | ${info}`);
     }
     if (hits) break;
     if (page % 20 === 0) console.log(`  …walked ${page} pages, ${checked} closed positions with ~target duration checked`);
