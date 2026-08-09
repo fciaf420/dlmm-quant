@@ -90,6 +90,7 @@ async function manage(){
         } catch(e){ log(`external-close cleanup err ${p.name}: ${String(e.message).slice(0,150)}`); }
         ev(`EXTERNAL CLOSE detected ${p.name} — swept residue, removing from registry${fin?` | wallet ${fin} SOL`:''}`);
         if (s.oorTicks) delete s.oorTicks[p.pool];
+        if (s.lastFeeRates) delete s.lastFeeRates[p.pool];   // fresh persistence per position (see exit path)
         journalTrade(p, 'EXTERNAL', null, fin ? +fin : null);
         fs.writeFileSync(DIR+'/positions.json', JSON.stringify(reg().filter(r=>r.pool!==p.pool),null,1));
         continue;
@@ -158,6 +159,12 @@ async function manage(){
           s.cooldowns[p.pool] = Date.now();
           if (p.mint) s.cooldowns[p.mint] = Date.now();   // mint-keyed too: blocks sibling-pool re-entry
           if (s.oorTicks) delete s.oorTicks[p.pool];
+          // CLEAR THE FEE HISTORY TOO (caught live 2026-08-09, BUTTHOLE 48Bdejg): lastFeeRates
+          // is pool-keyed and survived the position, so a re-entry's FIRST manage tick found a
+          // stale reading from the PREVIOUS position sitting in the "previous tick" slot - both
+          // halves of the x2 persistence satisfied at once. Deployed 17:28:39, exited 17:31:16
+          // logging "x2" after exactly ONE observation. Persistence must start fresh per position.
+          if (s.lastFeeRates) delete s.lastFeeRates[p.pool];
           journalTrade(p, trigger, +pnlPct.toFixed(2), fin ? +fin : null);
           ev(`EXITED ${p.name} | wallet ${fin} SOL`);
         } catch(e){ ev(`EXIT FAILED ${p.name}: ${String((e.stderr||'') + ' | ' + (e.message||'')).replace(/\s+/g,' ').slice(0,300)} — will retry next tick`); }
