@@ -120,25 +120,31 @@ async function holdersHunt(pool, mint, targetSec, T, tol, conc) {
 }
 
 let POOL_MINT = null;   // token_x of the resolved pool (the holders strategy needs it)
-async function resolvePool() {
+// Returns ALL pools matching the card, not the first. Caught live 2026-08-09 on the
+// BOT-SOL card: TWO pools shared the exact spec (binStep 200, baseFee 2%) on DIFFERENT
+// BOT tokens. Committing to the first scanned the wrong pool exhaustively and reported
+// "not found" - a confidently wrong answer. Ticker collisions are common on launches.
+async function resolvePools() {
   const explicit = arg('pool');
-  if (explicit) { const m = await jget(`${DATAPI}/pools/${explicit}`); POOL_MINT = m.token_x?.address; return explicit; }
+  if (explicit) { const m = await jget(`${DATAPI}/pools/${explicit}`); POOL_MINT = m.token_x?.address; return [{ pool: explicit, mint: POOL_MINT, name: m.name }]; }
   const pair = arg('pair'), binStep = +arg('binStep', 0), baseFee = arg('baseFee');
   const base = pair.split('-')[0];
   const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${base}`, { headers:{'x-api-key':JK} });
-  // token candidates, most liquid first; find one whose DLMM pools include the bin step
-  for (const t of (tk||[]).slice(0, 6)) {
+  const found = [];
+  for (const t of (tk||[]).slice(0, 20)) {
     const r = await rpc('getProgramAccounts', [DLMM_PROG, { encoding:'base64', dataSlice:{offset:0,length:0}, filters:[{dataSize:904},{memcmp:{offset:88,bytes:t.id}}] }]);
     for (const a of (r.result||[])) {
       const meta = await jget(`${DATAPI}/pools/${a.pubkey}`);
-      if ((!binStep || meta.pool_config?.bin_step === binStep) && (!baseFee || String(meta.pool_config?.base_fee_pct) === String(baseFee))) {
-        POOL_MINT = meta.token_x?.address;
-        console.log(`pool: ${a.pubkey}  (${meta.name}, binStep ${meta.pool_config?.bin_step}, baseFee ${meta.pool_config?.base_fee_pct}%)`);
-        return a.pubkey;
-      }
+      if ((!binStep || meta.pool_config?.bin_step === binStep) && (!baseFee || String(meta.pool_config?.base_fee_pct) === String(baseFee)))
+        found.push({ pool: a.pubkey, mint: meta.token_x?.address, name: meta.name, tvl: Math.round(meta.tvl||0), ageH: +((Date.now()-meta.created_at)/3600e3).toFixed(2) });
     }
   }
-  throw new Error('no pool matched pair/binStep/baseFee');
+  if (!found.length) throw new Error('no pool matched pair/binStep/baseFee');
+  if (found.length > 1) {
+    console.log(`${found.length} pools match this card's spec — will search each in turn (ticker collision):`);
+    for (const f of found) console.log(`   ${f.pool}  ${f.name} tvl ${f.tvl} age ${f.ageH}h`);
+  } else console.log(`pool: ${found[0].pool}  (${found[0].name})`);
+  return found;
 }
 
 // PnL targets from whatever flags the card showed. Absolute amounts ($/SOL) match on
@@ -271,8 +277,7 @@ async function deepScan(pool, hours, conc) {
   return { opens, closes };
 }
 
-(async () => {
-  const pool = await resolvePool();
+async function huntOne(pool) {
   const targetSec = durToSec(arg('duration', '0'));
   const T = pnlTargets();
   const tol = +arg('tol', 4);           // seconds of duration slop
@@ -383,4 +388,13 @@ async function deepScan(pool, hours, conc) {
     if (page % 20 === 0) console.log(`  …walked ${page} pages, ${checked} closed positions with ~target duration checked`);
   }
   if (!hits) console.log(`\nno closed match in ${page} pages (${checked} duration-candidates checked). Try --pages higher or --tol wider.`);
+}
+
+(async () => {
+  const pools = await resolvePools();
+  for (const [i, p] of pools.entries()) {
+    POOL_MINT = p.mint;
+    if (pools.length > 1) console.log(`\n───── searching pool ${i+1}/${pools.length}: ${p.pool} (${p.name}) ─────`);
+    try { await huntOne(p.pool); } catch(e) { console.log(`  pool errored: ${e.message}`); }
+  }
 })().catch(e => { console.error('ERR', e.message); process.exit(1); });
