@@ -31,7 +31,11 @@ const LW = {
   TOP_N:     num('LW_TOP_N', 10),        // candidates evaluated per tick
   THROTTLE:  num('LW_THROTTLE', 400),    // ms between Jupiter calls (shared key with the daemon)
 };
-const LOG = DIR + '/launch.log', SHADOW = DIR + '/shadow-launch.jsonl';
+// NOT named shadow-*.jsonl on purpose: replay.cjs ingests every file matching that
+// pattern, so launch-phase rows (measured at ~-4%% mean, see launchlab.cjs) would
+// silently contaminate the live class curves. Caught 2026-08-09 when a 4-row smoke
+// test showed up in replay's source list.
+const LOG = DIR + '/launch.log', SHADOW = DIR + '/launchwatch.jsonl';
 const log = (m) => { const l = `${new Date().toISOString()} | ${m}`; console.log(l); try { fs.appendFileSync(LOG, l+'\n'); } catch(e){} };
 const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
 let stopping = false;
