@@ -68,12 +68,34 @@ async function isLP(addr) {
 // and PDAs (an LP deposit looks exactly like a big SOL outflow), not other wallets. A
 // real wallet is owned by the System Program; everything else is a program account.
 const SYSTEM = '11111111111111111111111111111111';
-async function classify(addrs) {
+const TOKEN_PROG = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const ATOKEN_PROG = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const WSOL = 'So11111111111111111111111111111111111111112';
+// The wallet's OWN wSOL account looks exactly like a busy counterparty: SOL flows into
+// it on every wrap and out on every unwrap. Caught live 2026-08-09 - it was reported as
+// a second wallet trading 539 SOL back and forth, when it was the same operator wrapping
+// its own SOL. A temporary wSOL ATA is also CLOSED inside the same transaction, so by
+// query time it does not exist and a naive null check calls it 'wallet(empty)'.
+// Derive it up front and label it for what it is.
+function ownWsolAta(wallet) {
+  const { PublicKey } = require('@solana/web3.js');
+  const [ata] = PublicKey.findProgramAddressSync(
+    [new PublicKey(wallet).toBuffer(), new PublicKey(TOKEN_PROG).toBuffer(), new PublicKey(WSOL).toBuffer()],
+    new PublicKey(ATOKEN_PROG));
+  return ata.toBase58();
+}
+async function classify(addrs, wallet) {
   const kind = {};
+  const selfWsol = ownWsolAta(wallet);
   for (let i = 0; i < addrs.length; i += 100) {
     const chunk = addrs.slice(i, i+100);
     const r = await rpc('getMultipleAccounts', [chunk, { encoding:'base64', dataSlice:{offset:0,length:0} }]);
-    (r.result?.value||[]).forEach((v, j) => { kind[chunk[j]] = !v ? 'wallet(empty)' : (v.owner === SYSTEM ? 'wallet' : 'program/pool'); });
+    (r.result?.value||[]).forEach((v, j) => {
+      const a = chunk[j];
+      kind[a] = a === selfWsol ? 'self-wsol'
+              : !v ? 'closed-acct'                       // gone by query time = temp ATA, NOT a wallet
+              : (v.owner === SYSTEM ? 'wallet' : 'program/pool');
+    });
   }
   return kind;
 }
@@ -100,9 +122,11 @@ function summarize(list, minSol) {
   console.log(`open DLMM positions right now: ${open}`);
 
   const ins = summarize(f.inn, minSol), outs = summarize(f.out, minSol);
-  const kind = await classify([...new Set([...ins, ...outs].map(([a])=>a))]);
-  const wOut = outs.filter(([a])=>kind[a]?.startsWith('wallet')), wIn = ins.filter(([a])=>kind[a]?.startsWith('wallet'));
-  const pOut = outs.filter(([a])=>kind[a]==='program/pool');
+  const kind = await classify([...new Set([...ins, ...outs].map(([a])=>a))], wallet);
+  const isW = a => kind[a] === 'wallet';
+  const wOut = outs.filter(([a])=>isW(a)), wIn = ins.filter(([a])=>isW(a));
+  const selfW = [...outs, ...ins].filter(([a])=>kind[a]==='self-wsol');
+  const pOut = outs.filter(([a])=>kind[a]==='program/pool'||kind[a]==='closed-acct');
 
   if (wIn.length) {
     const [funder, d] = wIn[wIn.length-1];   // earliest significant inbound WALLET = likely funder
@@ -116,6 +140,7 @@ function summarize(list, minSol) {
   }
   console.log(`\nwallet → wallet INBOUND (≥${minSol} SOL):`);
   for (const [a,d] of wIn.slice(0,8)) console.log(`  ${a}  ${d.sol.toFixed(3)} SOL over ${d.n} tx  ${when(d.first)}`);
+  if (selfW.length) { const t=selfW.reduce((a,[,d])=>a+d.sol,0); console.log(`\n(self-wrap: ${t.toFixed(0)} SOL cycled through this wallet's OWN wSOL account — not a transfer)`); }
   // LP activity is the noisy majority — summarize, don't list every pool
   const lpSol = pOut.reduce((s,[,d])=>s+d.sol,0);
   console.log(`\n(LP/program activity, not money movement: ${pOut.length} pools/PDAs, ${lpSol.toFixed(0)} SOL deposited — excluded above)`);
