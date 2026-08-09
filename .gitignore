@@ -25,3 +25,4 @@ replay-cache.json
 # launchwatch observer output (not the daemon)
 shadow-launch.jsonl
 launch.log
+launchlab-cache.json
