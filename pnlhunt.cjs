@@ -10,13 +10,41 @@
 //   card "PNL  +X%"        -> datapi pnlPctChange   (ALWAYS USD %, even when PROFIT is labeled SOL)  -> --pnl
 //   card "PROFIT (USD) $X" -> datapi pnlUsd                                                          -> --pnlUsd
 //   card "PROFIT (SOL) X"  -> pnlUsd / SOL_price  (USD pnl expressed in SOL)                         -> --profitSol
-// The bottom-bar "PNL %" is the most reliable single anchor. Pair it with --duration.
-// Duration + the PNL% to ~2dp is effectively a unique fingerprint. Pipeline:
-//   1. resolve the pool  (on-chain getProgramAccounts by token mint + bin step; deterministic)
-//   2. cheap pass: check CURRENTLY-OPEN positions (card shared while still open)
-//   3. walk INITIALIZE_POSITION events newest-first; per position, on-chain sigs give
-//      open/close time -> duration; keep those within --tol seconds of the target
-//   4. confirm each candidate's owner via datapi closed-PnL (pnlPctChange, USD) ~= target
+// The card's "(BASE + QT)" vs "(QTF)" label is REAL, not boilerplate: BASE+QT deposits
+// both sides, QTF is quote-only (one-sided). Verified against allTimeDeposits on both.
+//
+// DURATION IS THE ESSENTIAL KEY - never match on PnL alone. Caught live on the HORACE
+// hunt: a wallet with $204.40 sat next to the true $203.006 and would have been a
+// confident false positive. Always pass --duration.
+//
+// STRATEGIES (auto-selected by pool traffic; override with --strategy):
+//   holders  - enumerate the TOKEN's holders (DAS getTokenAccounts) and query datapi
+//              per wallet. Independent of pool traffic, so it is the ONLY thing that
+//              works on hyperactive pools, and it does not touch the trading RPC's
+//              rate limit the way a full-history scan does. DEFAULT for busy pools.
+//   close    - scan recent pool history for ClosePosition, then read each position's
+//              own (tiny) history. Good on moderate pools.
+//   init     - walk INITIALIZE_POSITION newest-first. Good on quiet/young pools.
+//   open     - currently-open positions only (card shared while still live). Always run first.
+//
+// WHY holders EXISTS: HORACE-SOL ran ~25 tx/sec => ~850k txs over the pool's 95-min life
+// at ~24MB per 1000 txs (~20GB). Both scan strategies stall silently there. Also proven
+// dead ends: Helius rejects every server-side program/instruction filter (-32602), and
+// Meteora's /positions/{pool}/pnl ALWAYS requires `user` (no pool-wide listing exists).
+//
+// THE DECISIVE DETAIL for holders: showZeroBalance:true. An LP who exits leaves a
+// DRAINED token account behind, so the default holder view hides exactly the wallet you
+// are hunting. On HORACE: 2,995 holders without it (no match) vs 7,881 with it - the
+// target was only in the extra 4,886.
+//
+// ...BUT holders is TIME-SENSITIVE and can silently miss. Verified 2026-08-09 on that
+// same HORACE wallet ~1h later: it had CLOSED its drained token account to reclaim the
+// rent, and a closed ATA does not appear in getTokenAccounts at all (showZeroBalance
+// only surfaces accounts that still EXIST with zero balance). The datapi row was still
+// perfectly queryable - we simply had no way to enumerate that wallet. So: run holders
+// promptly after a card is posted, and treat "no match" as inconclusive on a busy pool,
+// never as proof of absence. On hyperactive pools there is currently no cheap COMPLETE
+// enumeration of past LPs - scans are ~20GB, datapi needs a `user`, and holder sets decay.
 const { RPC_URL, JUP_KEY: JK } = require('./config.cjs');
 const bs58 = require('bs58').default ?? require('bs58');
 const DLMM_PROG = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
@@ -41,8 +69,60 @@ async function jfetch(url, opts) {
 const rpc = (m, p) => jfetch(RPC_URL, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:m, params:p }) });
 const jget = (u) => jfetch(u);
 
+// Measure pool traffic before committing to a scan. A full-history scan on a 25 tx/sec
+// pool is ~20GB and stalls silently - the failure mode that wasted 17 min on HORACE.
+async function poolTxRate(pool) {
+  const r = await rpc('getSignaturesForAddress', [pool, { limit: 1000 }]);
+  const s = r.result || [];
+  if (s.length < 100) return 0;
+  const span = Math.max(1, s[0].blockTime - s[s.length-1].blockTime);
+  return s.length / span;
+}
+
+// HOLDERS STRATEGY: candidates from the token's holder set, not from pool history.
+// Cost is independent of pool traffic, and datapi (30 req/s) carries the load instead
+// of the Helius key the daemon trades on.
+async function holdersHunt(pool, mint, targetSec, T, tol, conc) {
+  const wallets = new Set();
+  let cursor = null, pages = 0;
+  for (;;) {
+    const params = { mint, limit: 1000, options: { showZeroBalance: true } };   // <-- exited LPs leave drained accounts
+    if (cursor) params.cursor = cursor;
+    const r = await jfetch(RPC_URL, { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getTokenAccounts', params }) });
+    const ta = r.result?.token_accounts || [];
+    for (const a of ta) if (a.owner) wallets.add(a.owner);
+    cursor = r.result?.cursor; pages++;
+    process.stdout.write(`\r  holders: ${wallets.size} wallets (${pages} pages)`);
+    if (!cursor || !ta.length || pages > 40) break;
+  }
+  console.log('');
+  const list = [...wallets];
+  let checked = 0;
+  const hits = [];
+  for (let i = 0; i < list.length; i += conc) {
+    await Promise.all(list.slice(i, i+conc).map(async (w) => {
+      try {
+        const r = await jget(`${DATAPI}/positions/${pool}/pnl?user=${w}&status=closed`);
+        for (const p of (r.positions||[])) {
+          const dur = (p.closedAt||0) - (p.createdAt||0);
+          if (Math.abs(dur - targetSec) <= tol && (!T.length || pnlMatch(p, T))) hits.push({ owner:w, row:p, dur });
+        }
+      } catch(e){}
+    }));
+    checked += Math.min(conc, list.length - i);
+    process.stdout.write(`\r  datapi: ${checked}/${list.length} wallets  (${hits.length} hits)`);
+    if (hits.length) break;
+    await sleep(60);
+  }
+  console.log('');
+  return hits;
+}
+
+let POOL_MINT = null;   // token_x of the resolved pool (the holders strategy needs it)
 async function resolvePool() {
-  const explicit = arg('pool'); if (explicit) return explicit;
+  const explicit = arg('pool');
+  if (explicit) { const m = await jget(`${DATAPI}/pools/${explicit}`); POOL_MINT = m.token_x?.address; return explicit; }
   const pair = arg('pair'), binStep = +arg('binStep', 0), baseFee = arg('baseFee');
   const base = pair.split('-')[0];
   const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${base}`, { headers:{'x-api-key':JK} });
@@ -52,6 +132,7 @@ async function resolvePool() {
     for (const a of (r.result||[])) {
       const meta = await jget(`${DATAPI}/pools/${a.pubkey}`);
       if ((!binStep || meta.pool_config?.bin_step === binStep) && (!baseFee || String(meta.pool_config?.base_fee_pct) === String(baseFee))) {
+        POOL_MINT = meta.token_x?.address;
         console.log(`pool: ${a.pubkey}  (${meta.name}, binStep ${meta.pool_config?.bin_step}, baseFee ${meta.pool_config?.base_fee_pct}%)`);
         return a.pubkey;
       }
@@ -207,6 +288,29 @@ async function deepScan(pool, hours, conc) {
       const age = p.createdAt ? Math.round(Date.now()/1000 - p.createdAt) : null;
       if (age!=null && Math.abs(age-targetSec)<=tol && (!T.length || pnlMatch(p, T)))
         console.log(`*** MATCH (OPEN) *** owner ${o}  age ${secToDur(age)}  pnl ${pnlShow(p, T)}`);
+    }
+  }
+
+  // --- pass 1.2: TRAFFIC GUARD + HOLDERS STRATEGY ---
+  // A scan's cost scales with pool traffic; the holders route does not. Measure first
+  // rather than stalling for 17 minutes on a 20GB scan (the HORACE failure mode).
+  const strategy = arg('strategy', 'auto');
+  const rate = await poolTxRate(pool);
+  const BUSY = +arg('busyTps', 5);
+  console.log(`pool traffic: ${rate.toFixed(1)} tx/sec` + (rate >= BUSY ? `  → too busy to scan; using holders strategy` : ''));
+  if (strategy === 'holders' || (strategy === 'auto' && rate >= BUSY)) {
+    if (!POOL_MINT) { console.log('  cannot run holders strategy: token mint unresolved'); }
+    else {
+      console.log(`holders strategy on mint ${POOL_MINT.slice(0,8)}… (showZeroBalance:true — exited LPs leave drained accounts)`);
+      const hits = await holdersHunt(pool, POOL_MINT, targetSec, T, tol, +arg('conc', 8));
+      for (const h of hits) {
+        const dep = typeof h.row.allTimeDeposits==='string' ? JSON.parse(h.row.allTimeDeposits) : h.row.allTimeDeposits;
+        const sided = (+dep?.tokenX?.amount > 0 && +dep?.tokenY?.amount > 0) ? 'TWO-SIDED (card: BASE + QT)'
+                    : (+dep?.tokenX?.amount > 0 ? 'ONE-SIDED (token only)' : 'ONE-SIDED (SOL only — card: QTF)');
+        console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${h.owner}\n  position ${h.row.positionAddress}\n  dur ${secToDur(h.dur)} | PNL% ${(+h.row.pnlPctChange).toFixed(2)} | pnlUsd $${(+h.row.pnlUsd).toFixed(2)} | pnlSol ${(+h.row.pnlSol).toFixed(3)}\n  deposits X ${(+dep?.tokenX?.amount||0).toFixed(2)} / SOL ${(+dep?.tokenY?.amount||0).toFixed(3)} → ${sided}\n  https://solscan.io/account/${h.owner}`);
+      }
+      if (!hits.length) console.log('\nno match in the holder set — INCONCLUSIVE, not proof of absence: an LP that\n  closed its drained token account (to reclaim rent) is unenumerable this way.\n  Try sooner after the card, widen --tol, or check sibling pools.');
+      return;
     }
   }
 
