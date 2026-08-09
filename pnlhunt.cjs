@@ -1,12 +1,14 @@
 // pnlhunt.cjs — identify the wallet behind a Meteora DLMM PnL card (RocketScan/metlex/LP Army style).
 // Read-only. Uses the Helius RPC in .env (RPC_URL) + Meteora datapi. No writes, no keys printed.
 //
-// usage:
-//   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --baseFee 2 --duration 7:28 --pnl 17.17 [--pages 250] [--tol 4]
-//   node pnlhunt.cjs --pool <ADDR> --duration 7:28 --pnl 17.17
+// usage (give whichever PnL flavor the card shows — cards toggle $/% and USD/SOL):
+//   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --baseFee 2 --duration 7:28 --pnl 17.17
+//   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --duration 7:28 --pnlUsd 63.54
+//   node pnlhunt.cjs --pool <ADDR> --duration 7:28 --pnlSolPct 17.17     # "PNL (SOL) +17.17%"
+//   flags: --pnl (USD %)  --pnlSolPct (SOL %)  --pnlUsd ($)  --pnlSol (SOL amount)  [--pages 250] [--tol 4]
 //
-// A card leaks: pair name, bin step, base fee, hold duration (hh:mm:ss), and PnL% (USD).
-// Duration + PnL-to-2dp is effectively a unique fingerprint. Pipeline:
+// A card always shows hold duration (hh:mm:ss) + one PnL number in one of four flavors.
+// Duration + any single PnL flavor to ~2dp is effectively a unique fingerprint. Pipeline:
 //   1. resolve the pool  (on-chain getProgramAccounts by token mint + bin step; deterministic)
 //   2. cheap pass: check CURRENTLY-OPEN positions (card shared while still open)
 //   3. walk INITIALIZE_POSITION events newest-first; per position, on-chain sigs give
@@ -55,18 +57,27 @@ async function resolvePool() {
   throw new Error('no pool matched pair/binStep/baseFee');
 }
 
-async function ownerClosedPnl(pool, owner) {
-  const r = await jget(`${DATAPI}/positions/${pool}/pnl?user=${owner}&status=closed`);
-  return (r.positions||[]).map(p => ({ pct:+p.pnlPctChange, dur:(p.closedAt&&p.createdAt)?p.closedAt-p.createdAt:null, closedAt:p.closedAt }));
+// PnL targets from whatever flags the card showed. Absolute amounts ($/SOL) match on
+// relative tolerance (card rounding); percentages match on absolute tolerance.
+function pnlTargets() {
+  const T = [];
+  if (arg('pnl')       != null) T.push({ field:'pnlPctChange',    v:+arg('pnl'),       abs:0.3,  label:'USD%' });
+  if (arg('pnlSolPct') != null) T.push({ field:'pnlSolPctChange', v:+arg('pnlSolPct'), abs:0.3,  label:'SOL%' });
+  if (arg('pnlUsd')    != null) T.push({ field:'pnlUsd',          v:+arg('pnlUsd'),    rel:0.02, label:'$'   });
+  if (arg('pnlSol')    != null) T.push({ field:'pnlSol',          v:+arg('pnlSol'),    rel:0.02, label:'SOL' });
+  return T;
 }
+const pnlMatch = (row, T) => T.every(t => t.abs != null ? Math.abs(+row[t.field]-t.v) <= t.abs
+                                                        : Math.abs(+row[t.field]-t.v) <= Math.max(t.rel*Math.abs(t.v), 0.01));
+const pnlShow = (row, T) => (T.length?T:[{field:'pnlPctChange',label:'USD%'}]).map(t=>`${t.label} ${(+row[t.field]).toFixed(2)}`).join(' / ');
 
 (async () => {
   const pool = await resolvePool();
   const targetSec = durToSec(arg('duration', '0'));
-  const targetPnl = arg('pnl') != null ? +arg('pnl') : null;
+  const T = pnlTargets();
   const tol = +arg('tol', 4);           // seconds of duration slop
   const maxPages = +arg('pages', 250);
-  console.log(`target: duration ${secToDur(targetSec)} (±${tol}s), pnl ${targetPnl!=null?'+'+targetPnl+'%':'(any)'}\n`);
+  console.log(`target: duration ${secToDur(targetSec)} (±${tol}s), pnl ${T.length?T.map(t=>t.label+' '+t.v).join(' & '):'(any)'}\n`);
 
   // --- pass 1: currently-open positions (cheap) ---
   const open = await rpc('getProgramAccounts', [DLMM_PROG, { encoding:'base64', dataSlice:{offset:40,length:32}, filters:[{dataSize:8120},{memcmp:{offset:8,bytes:pool}}] }]);
@@ -75,8 +86,8 @@ async function ownerClosedPnl(pool, owner) {
     const r = await jget(`${DATAPI}/positions/${pool}/pnl?user=${o}&status=open`);
     for (const p of (r.positions||[])) {
       const age = p.createdAt ? Math.round(Date.now()/1000 - p.createdAt) : null;
-      if (age!=null && Math.abs(age-targetSec)<=tol && (targetPnl==null || Math.abs(+p.pnlPctChange-targetPnl)<0.3))
-        console.log(`*** MATCH (OPEN) *** owner ${o}  age ${secToDur(age)}  pnl ${(+p.pnlPctChange).toFixed(2)}% USD`);
+      if (age!=null && Math.abs(age-targetSec)<=tol && (!T.length || pnlMatch(p, T)))
+        console.log(`*** MATCH (OPEN) *** owner ${o}  age ${secToDur(age)}  pnl ${pnlShow(p, T)}`);
     }
   }
 
@@ -103,10 +114,11 @@ async function ownerClosedPnl(pool, owner) {
       const dur = closeT - openT; checked++;
       if (Math.abs(dur - targetSec) > tol) continue;
       // duration matches — confirm PnL via datapi (owner's closed positions)
-      const cp = await ownerClosedPnl(pool, owner);
-      const m = cp.find(x => x.dur!=null && Math.abs(x.dur-targetSec)<=tol && (targetPnl==null || Math.abs(x.pct-targetPnl)<0.3));
-      if (m) { console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${owner}\n  position ${position}\n  duration ${secToDur(m.dur)}  pnl ${m.pct.toFixed(2)}% USD\n  https://solscan.io/account/${owner}`); hits++; }
-      else console.log(`  dur-match ${secToDur(dur)} owner ${owner.slice(0,6)}… but pnl not confirmed (${cp.map(x=>x.pct.toFixed(1)).join(',')||'no closed rows'})`);
+      const cr = await jget(`${DATAPI}/positions/${pool}/pnl?user=${owner}&status=closed`);
+      const crows = (cr.positions||[]).map(p => ({ ...p, dur:(p.closedAt&&p.createdAt)?p.closedAt-p.createdAt:null }));
+      const m = crows.find(x => x.dur!=null && Math.abs(x.dur-targetSec)<=tol && (!T.length || pnlMatch(x, T)));
+      if (m) { console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${owner}\n  position ${position}\n  duration ${secToDur(m.dur)}  pnl ${pnlShow(m, T)}\n  https://solscan.io/account/${owner}`); hits++; }
+      else console.log(`  dur-match ${secToDur(dur)} owner ${owner.slice(0,6)}… pnl no-confirm (${crows.map(x=>pnlShow(x,T)).join(' | ')||'no closed rows'})`);
     }
     if (hits) break;
     if (page % 20 === 0) console.log(`  …walked ${page} pages, ${checked} closed positions with ~target duration checked`);
