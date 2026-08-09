@@ -199,6 +199,7 @@ node deploy.cjs --pool <P> --size 0.3 --mode two --widthPct 18 --tp 20 --sl -15 
 node deploy.cjs ... --dry                # plan only, no transactions
 node exit.cjs --pool <P>                 # close all positions in pool, sweep to SOL
 node jupswap.cjs <inMint> <outMint> <rawAmount>
+node pnlhunt.cjs --pair X-SOL --binStep N --baseFee N --duration hh:mm:ss --pnl P  # identify the wallet behind a PnL card
 touch STOP                               # stop the daemon gracefully
 ```
 
@@ -216,6 +217,36 @@ Scan lines, deploys, and exits all print a clickable `meteora.ag/dlmm/<pool>` li
 | `events.log` | every deploy/exit/failure, with the actual error text |
 | `daemon.log` | heartbeat + every scan verdict with reasons |
 | `.pending-swap.json` | crash-recovery ledger for a swap whose position didn't land |
+
+## Identifying the wallet behind a PnL card (`pnlhunt.cjs`)
+
+Those RocketScan / metlex / LP Army "gud fee tek" cards leak a precise fingerprint: pair, bin step, base fee, hold duration, and a PnL number. `pnlhunt.cjs` turns that back into the on-chain wallet. Read-only — it reuses the Helius RPC in `.env` (429 backoff built in) plus the Meteora datapi, and never touches the trading side.
+
+```bash
+node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --baseFee 2 --duration 7:28 --pnl 17.17
+node pnlhunt.cjs --pair STONK-SOL  --binStep 50  --baseFee 0.5 --duration 9:54:46 --pnl 1.38
+```
+
+How it works:
+1. **Resolves the exact pool** on-chain (`getProgramAccounts` on the DLMM program, filtered by token mint + bin step) — deterministic, instant.
+2. **Checks currently-open positions** first (cheap — catches a card shared while the position is still live).
+3. **Walks position-open events newest-first**, gets each position's open/close time on-chain → hold duration, keeps the ones within `--tol` seconds of the card, then **confirms the PnL** against the datapi row.
+
+Reading the card → flags:
+
+| Card field | Flag | datapi field |
+|---|---|---|
+| bottom-bar `PNL +X%` | `--pnl X` | `pnlPctChange` (USD %, the reliable anchor) |
+| `PROFIT (USD) $X` | `--pnlUsd X` | `pnlUsd` |
+| `PROFIT (SOL) X` | `--profitSol X` | `pnlUsd ÷ SOL price` |
+| hold time (always shown) | `--duration hh:mm:ss` | `closedAt − createdAt` |
+
+**Lead with `--duration` + `--pnl`** — hold time to the second plus the PNL% is effectively a unique key. Note the card's "PNL %" is always the *USD* percent even when PROFIT is labeled in SOL.
+
+Notes / limits:
+- No timestamp on cards, so it walks newest-first with a `--pages` budget (default 250). A **long hold** must be walked back the full `(time since posted) + (hold duration)` — a 10h hold on a busy pool needs `--pages 600+` and a few minutes; the free Helius plan is the bottleneck.
+- Widen `--tol` (duration seconds) if a card's number is rounded oddly, or run on `--duration` alone and eyeball the candidates it prints (each shows owner, position, fees, deposit, entry price).
+- If the card was shared while still open, the same command catches it in pass 2 with no walk.
 
 ## Run it 24/7
 
