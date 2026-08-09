@@ -296,7 +296,12 @@ async function deepScan(pool, hours, conc) {
   // rather than stalling for 17 minutes on a 20GB scan (the HORACE failure mode).
   const strategy = arg('strategy', 'auto');
   const rate = await poolTxRate(pool);
-  const BUSY = +arg('busyTps', 5);
+  // Threshold calibrated from both ends: HORACE ran 200 tx/sec (~20GB, genuinely
+  // unscannable) while BOT ran 7.4 tx/sec (~27k txs/hour = ~27 calls, trivially
+  // scannable) - the first cutoff of 5 sent BOT down the holders path for nothing.
+  // Scanning is EXACT where holders is best-effort (an LP that closed its drained
+  // token account is unenumerable), so prefer scanning whenever it is affordable.
+  const BUSY = +arg('busyTps', 40);
   console.log(`pool traffic: ${rate.toFixed(1)} tx/sec` + (rate >= BUSY ? `  → too busy to scan; using holders strategy` : ''));
   if (strategy === 'holders' || (strategy === 'auto' && rate >= BUSY)) {
     if (!POOL_MINT) { console.log('  cannot run holders strategy: token mint unresolved'); }
