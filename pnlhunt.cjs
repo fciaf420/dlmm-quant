@@ -4,7 +4,9 @@
 // usage (give whichever PnL flavor the card shows — cards toggle $/% and USD/SOL):
 //   node pnlhunt.cjs --pair CHARITY-SOL --binStep 200 --baseFee 2 --duration 7:28 --pnl 17.17
 //   node pnlhunt.cjs --pair STONK-SOL  --binStep 50  --baseFee 0.5 --duration 9:54:46 --pnl 1.38
-//   flags: --pnl (the card's "PNL %")  --pnlUsd ($)  --profitSol (card "PROFIT (SOL)")  --pnlSolPct (rare)  [--pages 250] [--tol 6]
+//   flags: --pnl (card "PNL %")  --pnlUsd ($)  --profitSol  --pnlSolPct  [--pages 250] [--tol 6]
+// TOTALS CARDS ("MY TOTAL FEES FROM DLMM POOL" - no TIME field) use a different mode:
+//   node pnlhunt.cjs --pair MANLET-SOL --binStep 80 --baseFee 1 --feesX 371980 --feesSol 25.26
 //
 // FIELD MAP (learned from real cards — metlex/RocketScan use a USD basis):
 //   card "PNL  +X%"        -> datapi pnlPctChange   (ALWAYS USD %, even when PROFIT is labeled SOL)  -> --pnl
@@ -68,6 +70,71 @@ async function jfetch(url, opts) {
 }
 const rpc = (m, p) => jfetch(RPC_URL, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ jsonrpc:'2.0', id:1, method:m, params:p }) });
 const jget = (u) => jfetch(u);
+
+// datapi pages positions at 20. Summing page 1 only silently UNDERCOUNTS, and heavy
+// LPs - exactly the wallets that post a totals card - are the worst affected (caught
+// 2026-08-10: a wallet read 353k fees on page 1 vs 543k across all 28 positions).
+async function allPages(pool, user, status) {
+  let out = [], page = 1;
+  for (;;) {
+    const r = await jget(`${DATAPI}/positions/${pool}/pnl?user=${user}&status=${status}&page=${page}`);
+    const p = r.positions || []; out = out.concat(p);
+    if (out.length >= (r.totalCount||0) || !p.length || page > 15) break;
+    page++;
+  }
+  return out;
+}
+const feesOf = (p) => { const f = typeof p.allTimeFees==='string' ? JSON.parse(p.allTimeFees) : (p.allTimeFees||{});
+  return { x:+(f.tokenX?.amount||0), y:+(f.tokenY?.amount||0), usd:(+(f.tokenX?.usd||0))+(+(f.tokenY?.usd||0)) }; };
+
+// TOTALS-CARD MODE ("MY TOTAL FEES FROM DLMM POOL"): these cards have NO duration -
+// the key that makes position cards uniquely identifiable - so match on cumulative fees
+// instead, with two synthetic keys that make it defensible:
+//   1. fees only ever GROW, so the true wallet must now EXCEED both card totals
+//   2. the fee RATIO (tokenX per SOL) is a composition property of how a wallet LPs
+// Ratio narrows; only the CURVE RECONSTRUCTION is conclusive - replay each candidate's
+// positions in close-time order and require the running totals to pass through BOTH
+// card numbers at the SAME moment. Verified on the MANLET card: the ratio leader was
+// 20%% off on that test while the true wallet hit 0.0%%/0.7%%.
+async function feesHunt(pool, mint, targetX, targetY, conc) {
+  const set = new Set(); let cursor = null;
+  for (let i = 0; i < 40; i++) {
+    const params = { mint, limit:1000, options:{ showZeroBalance:true } };
+    if (cursor) params.cursor = cursor;
+    const r = await jfetch(RPC_URL, { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getTokenAccounts', params }) });
+    const ta = r.result?.token_accounts || [];
+    for (const a of ta) if (a.owner) set.add(a.owner);
+    cursor = r.result?.cursor; process.stdout.write(`\r  holders ${set.size}`);
+    if (!cursor || !ta.length) break;
+  }
+  const wallets = [...set]; console.log('');
+  const ratio = targetX / targetY, scored = [];
+  for (let i = 0; i < wallets.length; i += conc) {
+    await Promise.all(wallets.slice(i, i+conc).map(async w => {
+      let fx=0, fy=0, n=0;
+      for (const st of ['open','closed']) { try { for (const p of await allPages(pool,w,st)) { const f=feesOf(p); fx+=f.x; fy+=f.y; n++; } } catch(e){} }
+      if (n && fy > 0.5) scored.push({ w, fx, fy, n });
+    }));
+    if (i % 400 === 0) process.stdout.write(`\r  checked ${Math.min(i+conc,wallets.length)}/${wallets.length} (${scored.length} LPs)`);
+  }
+  const plaus = scored.filter(s => s.fx >= targetX*0.97 && s.fy >= targetY*0.97);
+  plaus.forEach(s => s.rerr = Math.abs((s.fx/s.fy) - ratio) / ratio);
+  plaus.sort((a,b) => a.rerr - b.rerr);
+  console.log(`\n\n${scored.length} wallets earned fees here | ${plaus.length} exceed both card totals`);
+  // conclusive test on the ratio-closest candidates
+  for (const s of plaus.slice(0, 6)) {
+    const rows = [];
+    for (const st of ['closed','open']) for (const p of await allPages(pool,s.w,st)) { const f = feesOf(p); rows.push({ t: p.closedAt || Math.floor(Date.now()/1000), x:f.x, y:f.y }); }
+    rows.sort((a,b)=>a.t-b.t);
+    let cx=0, cy=0, best=null;
+    for (const r of rows) { cx+=r.x; cy+=r.y; const ex=Math.abs(cx-targetX)/targetX, ey=Math.abs(cy-targetY)/targetY;
+      if (!best || ex+ey < best.tot) best = { t:r.t, cx, cy, ex, ey, tot:ex+ey }; }
+    const hit = best && best.ex < 0.05 && best.ey < 0.05;
+    console.log(`  ${s.w} | ${s.n} pos | now ${Math.round(s.fx).toLocaleString()}/${s.fy.toFixed(2)} | curve best ${Math.round(best.cx).toLocaleString()}/${best.cy.toFixed(2)} @ ${new Date(best.t*1000).toISOString().slice(5,16)} (err ${(best.ex*100).toFixed(1)}%/${(best.ey*100).toFixed(1)}%)${hit?'   <<<< MATCH':''}`);
+    if (hit) console.log(`\n*** MATCH ***\n  owner ${s.w}\n  https://solscan.io/account/${s.w}`);
+  }
+}
 
 // Measure pool traffic before committing to a scan. A full-history scan on a 25 tx/sec
 // pool is ~20GB and stalls silently - the failure mode that wasted 17 min on HORACE.
@@ -278,6 +345,13 @@ async function deepScan(pool, hours, conc) {
 }
 
 async function huntOne(pool) {
+  // TOTALS-CARD branch: --feesX / --feesSol instead of --duration / --pnl
+  if (arg('feesX') != null && arg('feesSol') != null) {
+    if (!POOL_MINT) { console.log('  need the token mint — pass --pool or --pair'); return; }
+    console.log(`totals-card mode: ${(+arg('feesX')).toLocaleString()} tokenX + ${arg('feesSol')} SOL (ratio ${Math.round(+arg('feesX')/+arg('feesSol')).toLocaleString()}/SOL)`);
+    await feesHunt(pool, POOL_MINT, +arg('feesX'), +arg('feesSol'), +arg('conc', 10));
+    return;
+  }
   const targetSec = durToSec(arg('duration', '0'));
   const T = pnlTargets();
   const tol = +arg('tol', 4);           // seconds of duration slop
