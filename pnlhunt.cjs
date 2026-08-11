@@ -12,8 +12,13 @@
 //   card "PNL  +X%"        -> datapi pnlPctChange   (ALWAYS USD %, even when PROFIT is labeled SOL)  -> --pnl
 //   card "PROFIT (USD) $X" -> datapi pnlUsd                                                          -> --pnlUsd
 //   card "PROFIT (SOL) X"  -> pnlUsd / SOL_price  (USD pnl expressed in SOL)                         -> --profitSol
-// The card's "(BASE + QT)" vs "(QTF)" label is REAL, not boilerplate: BASE+QT deposits
-// both sides, QTF is quote-only (one-sided). Verified against allTimeDeposits on both.
+// The card's "(BASE + QT)" vs "(QTF)" label is REAL, not boilerplate, and QTF means the
+// OPPOSITE of what it sounds like. Verified against allTimeDeposits 2026-08-11:
+//   BASE + QT = base token AND quote token deposited = TWO-SIDED
+//   QTF       = "quote-token-free" = BASE TOKEN ONLY, zero SOL = one-sided SELL ladder
+//               (tokens placed ABOVE price, sold off bin by bin as price rises).
+// The THEO card (QTF) deposited 486,841 tokens + 0.0000 SOL and withdrew 129,885 tokens
+// + 2.0947 SOL - i.e. ~73%% of the token side sold into the move, for +89%%.
 //
 // DURATION IS THE ESSENTIAL KEY - never match on PnL alone. Caught live on the HORACE
 // hunt: a wallet with $204.40 sat next to the true $203.006 and would have been a
@@ -390,7 +395,7 @@ async function huntOne(pool) {
       for (const h of hits) {
         const dep = typeof h.row.allTimeDeposits==='string' ? JSON.parse(h.row.allTimeDeposits) : h.row.allTimeDeposits;
         const sided = (+dep?.tokenX?.amount > 0 && +dep?.tokenY?.amount > 0) ? 'TWO-SIDED (card: BASE + QT)'
-                    : (+dep?.tokenX?.amount > 0 ? 'ONE-SIDED (token only)' : 'ONE-SIDED (SOL only — card: QTF)');
+                    : (+dep?.tokenX?.amount > 0 ? 'ONE-SIDED (token only — card: QTF)' : 'ONE-SIDED (SOL only)');
         console.log(`\n*** MATCH (CLOSED) ***\n  owner    ${h.owner}\n  position ${h.row.positionAddress}\n  dur ${secToDur(h.dur)} | PNL% ${(+h.row.pnlPctChange).toFixed(2)} | pnlUsd $${(+h.row.pnlUsd).toFixed(2)} | pnlSol ${(+h.row.pnlSol).toFixed(3)}\n  deposits X ${(+dep?.tokenX?.amount||0).toFixed(2)} / SOL ${(+dep?.tokenY?.amount||0).toFixed(3)} → ${sided}\n  https://solscan.io/account/${h.owner}`);
       }
       if (!hits.length) console.log('\nno match in the holder set — INCONCLUSIVE, not proof of absence: an LP that\n  closed its drained token account (to reclaim rent) is unenumerable this way.\n  Try sooner after the card, widen --tol, or check sibling pools.');
