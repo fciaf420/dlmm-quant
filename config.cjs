@@ -64,6 +64,9 @@ const CFG = {
   SIZE_BASING:     num('SIZE_BASING', 0.3),
   SIZE_CARRY:      num('SIZE_CARRY', 0.4),
   SIZE_SQUEEZE:    num('SIZE_SQUEEZE', 0.3),
+  // Total principal across both layers of one automated Bid-Ask + Spot
+  // accumulation. This is one 1 SOL position, not 1 SOL per layer.
+  SIZE_BID_ASK:    num('SIZE_BID_ASK', 1),
 
   // deploy mechanics
   MAX_BINS:        num('MAX_BINS', 140),     // AddLiquidityByStrategy2 OOMs above ~145
@@ -92,5 +95,11 @@ const CFG = {
   TP_SQUEEZE:      num('TP_SQUEEZE', 0),
   SL_SQUEEZE:      num('SL_SQUEEZE', 0),
 };
+
+const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
+if (CFG.QUOTE_MINT !== WRAPPED_SOL) {
+  console.error(`config: QUOTE_MINT must be wrapped SOL (${WRAPPED_SOL}); deploy amounts are denominated in lamports`);
+  process.exit(1);
+}
 
 module.exports = { RPC_URL, JUP_KEY, keypair, CFG };

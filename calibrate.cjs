@@ -52,9 +52,12 @@ const f2 = (v) => v == null ? '—' : v.toFixed(1);
     const wins = pnls.filter((x) => x > 0), losses = pnls.filter((x) => x < 0).map(Math.abs);
     console.log(`=== ${cls} — ${T.length} trades ===`);
     console.log('  exit triggers:', Object.entries(trig).map(([k, v]) => `${k}×${v}`).join('  '));
+    const accum = T.some((t) => t.profile === 'ACCUM' || t.label === 'BID_ASK');
     if (pnls.length) {
       console.log(`  pnl (SOL%%): win ${wins.length}/${pnls.length} | avg ${f2(pnls.reduce((a, b) => a + b, 0) / pnls.length)} | p25 ${f2(pct(pnls, .25))} | med ${f2(pct(pnls, .5))} | p75 ${f2(pct(pnls, .75))} | p90 ${f2(pct(pnls, .9))}`);
-      if (T.length >= 20) {
+      if (accum) {
+        console.log('  ACCUM lifecycle: descriptive outcomes only; TP/SL bracket calibration does not apply.');
+      } else if (T.length >= 20) {
         console.log(`  PROPOSAL: TP ≈ p75 of winners = ${f2(pct(wins, .75))}%% | SL ≈ p90 of losses = ${f2(pct(losses, .9))}%%`);
         console.log(`            review, then apply via .env: TP_${cls}= / SL_${cls}= (SL positive)`);
       } else {

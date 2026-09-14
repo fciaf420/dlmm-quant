@@ -32,6 +32,10 @@ function pnlPrice(r, W) {  // W as fraction (0.15 = ±15%)
 }
 
 async function simulate(row) {
+  // BID ASK is a quote-only, two-shape accumulation profile with a conjunctive
+  // fee-decay+distribution exit. The uniform two-sided TRADE payoff below does
+  // not model its inventory path, so never turn these rows into fake evidence.
+  if (row.sig === 'BID_ASK' || row.profile === 'ACCUM') return { skip: 'unsupported-accum-profile' };
   const cls = row.sig || 'IGNITION';
   const W = (row.w || Math.min(30, Math.max(12, Math.round(row.sigma / 4)))) / 100;
   const tp = row.sig ? null : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + row.fr * 0.5)));  // cap-aware
@@ -99,8 +103,11 @@ async function simulate(row) {
     await sleep(150);
   }
   fs.writeFileSync(DIR + '/replay-cache.json', JSON.stringify(cache));
-  const done = rows.map((r) => ({ row: r, res: cache[r.t + ':' + r.pool] })).filter((x) => x.res && !x.res.skip);
+  const done = rows.map((r) => ({ row: r, res: cache[r.t + ':' + r.pool] }))
+    .filter((x) => x.row.sig !== 'BID_ASK' && x.row.profile !== 'ACCUM' && x.res && !x.res.skip);
+  const accumSkipped = rows.filter((r) => r.sig === 'BID_ASK' || r.profile === 'ACCUM').length;
   console.log(`shadow log: ${rows.length} observations | replayed: ${Object.keys(cache).length} (${fetched} new this run) | usable: ${done.length}\n`);
+  if (accumSkipped) console.log(`BID ASK/ACCUM skipped: ${accumSkipped} (hybrid inventory and exit model not implemented)\n`);
   if (!done.length) return;
 
   const BUCKETS = [[0, 0.5], [0.5, 1], [1, 1.5], [1.5, 2], [2, 3], [3, 99]];

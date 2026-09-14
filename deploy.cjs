@@ -3,20 +3,47 @@ const fs = require('fs');
 const DLMMImport = require('@meteora-ag/dlmm');
 const DLMM = DLMMImport.default ?? DLMMImport;
 const { StrategyType } = DLMMImport;
-const { Connection, Keypair, PublicKey, sendAndConfirmTransaction, VersionedTransaction } = require('@solana/web3.js');
+const { Connection, Keypair, PublicKey, VersionedTransaction } = require('@solana/web3.js');
 const BN = require('bn.js');
 const { sendConfirm, confirmSig } = require('./sendtx.cjs');
+const GATES = require('./gates.cjs');
+const { makeBidAskJournal, runBidAskPhases, validateFundingRange, phaseLiquidity,
+  reconcileSubmitted, matchesJournalRow, remainingPrincipalLamports } = require('./bid_ask_exec.cjs');
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
 const SOLM = CFG.QUOTE_MINT;
 const arg = (k, d) => { const i = process.argv.indexOf('--'+k); return i>0 ? process.argv[i+1] : d; };
 const DRY = process.argv.includes('--dry');
+const RESUME = process.argv.includes('--resume');
+const RETRY_FAILED = process.argv.includes('--retry-failed');
+const BID_ASK_PENDING = __dirname + '/.pending-bid-ask.json';
+const readBidAskPending = () => {
+  try { return JSON.parse(fs.readFileSync(BID_ASK_PENDING, 'utf8')); } catch (e) { return null; }
+};
+const writeJsonAtomic = (file, value) => {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 1));
+  fs.renameSync(tmp, file);
+};
 // Ctrl-C in a terminal hits the whole process group. Killing mid-deploy can leave an
 // on-chain position that positions.json never records, so ignore SIGINT and finish.
 // The parent's 480s timeout is the real backstop; kill -9 still works.
 process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to keep the registry consistent'));
 (async () => {
-  const POOL = arg('pool'), size = +arg('size','0.3'), mode = arg('mode','two'), widthPct = +arg('widthPct','18');
-  const tp = +arg('tp','20'), sl = +arg('sl','-15'), stopPrice = +arg('stopPrice','0'), label = arg('label','POS');
+  const pendingOnDisk = readBidAskPending();
+  if (RESUME && !pendingOnDisk) throw new Error('no pending BID ASK deployment to resume');
+  if (!RESUME && pendingOnDisk) throw new Error(`pending BID ASK deployment ${pendingOnDisk.position || ''} must be resumed before starting another deploy`);
+  let pendingBidAsk = RESUME ? pendingOnDisk : null;
+  const POOL = pendingBidAsk ? pendingBidAsk.pool : arg('pool');
+  const size = pendingBidAsk ? pendingBidAsk.sizeLamports / 1e9 : +arg('size','0.3');
+  const mode = pendingBidAsk ? 'single' : arg('mode','two');
+  const widthPct = pendingBidAsk ? pendingBidAsk.depthPct : +arg('widthPct','18');
+  const tp = pendingBidAsk ? 0 : +arg('tp','20');
+  const sl = pendingBidAsk ? 0 : +arg('sl','-15');
+  const stopPrice = pendingBidAsk ? 0 : +arg('stopPrice','0');
+  const label = pendingBidAsk ? 'BID_ASK' : arg('label','POS');
+  const profile = pendingBidAsk ? 'ACCUM' : arg('profile', label === 'BID_ASK' ? 'ACCUM' : 'TRADE');
+  const hybrid = !!pendingBidAsk || label === 'BID_ASK' || arg('shape','spot') === 'hybrid';
+  if (!POOL) throw new Error('missing --pool');
   const rpc = RPC_URL;
   const user = keypair();
   const conn = new Connection(rpc, 'confirmed');
@@ -29,13 +56,16 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   }
   process.on('exit', () => { try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch(e){} });
   const reg0 = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
-  if (reg0.find(r => r.pool === POOL)) { console.error('DUPLICATE: position already exists for this pool'); process.exit(4); }
-  if (reg0.length >= CFG.MAX_POSITIONS) { console.error(`CAP: ${reg0.length} positions already open (MAX_POSITIONS=${CFG.MAX_POSITIONS})`); process.exit(5); }
+  const ownPending = pendingBidAsk && reg0.find(r => matchesJournalRow(r, pendingBidAsk));
+  if (reg0.find(r => r.pool === POOL && (!ownPending || r.position !== ownPending.position))) {
+    console.error('DUPLICATE: position already exists for this pool'); process.exit(4);
+  }
+  if (!ownPending && reg0.length >= CFG.MAX_POSITIONS) { console.error(`CAP: ${reg0.length} positions already open (MAX_POSITIONS=${CFG.MAX_POSITIONS})`); process.exit(5); }
   const pool = await (await fetch(`https://dlmm.datapi.meteora.ag/pools/${POOL}`)).json();
   // The whole deploy assumes X is the token being bought and Y is SOL: it swaps SOL->X
   // and passes solSide*1e9 as totalYAmount. Pools quoted in anything else (SOL-HYPE has
   // X=SOL, USDC pools have Y=USDC) would swap SOL->SOL and deposit the wrong decimals.
-  if (pool.token_y?.address !== SOLM) {
+  if (!pool.token_x?.address || pool.token_x.address === SOLM || pool.token_y?.address !== SOLM) {
     console.error(`UNSUPPORTED QUOTE: ${pool.name} has token_y=${pool.token_y?.symbol||'?'}, expected SOL — this deploy path only handles X/SOL pools`);
     process.exit(6);
   }
@@ -44,8 +74,18 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   // different pools - same token, double the risk, both slots of the 2-position cap
   // burned on one thesis). The pool-keyed check above can't see sibling pools of the
   // same token; this one can. Same exit code as the pool dup.
-  if (reg0.find(r => r.mint === MINT)) { console.error('DUPLICATE: token already held via another pool'); process.exit(4); }
-  const binStepPct = pool.pool_config.bin_step / 100;
+  if (reg0.find(r => r.mint === MINT && (!ownPending || r.position !== ownPending.position))) { console.error('DUPLICATE: token already held via another pool'); process.exit(4); }
+  let dlmm = await DLMM.create(conn, new PublicKey(POOL));
+  const chainX = dlmm.lbPair?.tokenXMint?.toBase58?.() || dlmm.tokenX?.publicKey?.toBase58?.();
+  const chainY = dlmm.lbPair?.tokenYMint?.toBase58?.() || dlmm.tokenY?.publicKey?.toBase58?.();
+  if (chainX !== MINT || chainX === SOLM || chainY !== SOLM) {
+    throw new Error(`pool mint orientation mismatch: datapi ${MINT}/${SOLM}, on-chain ${chainX||'?'}/${chainY||'?'}`);
+  }
+  const apiBinStep = Number(pool.pool_config?.bin_step);
+  const binStepBps = Number(dlmm.lbPair?.binStep);
+  if (!Number.isFinite(binStepBps) || binStepBps <= 0 || apiBinStep !== binStepBps) {
+    throw new Error(`pool bin-step mismatch: datapi ${apiBinStep}, on-chain ${binStepBps}`);
+  }
   // Position sizing. initializePositionAndAddLiquidityByStrategy creates the account via
   // CPI, so it can only cover DEFAULT_BIN_PER_POSITION (70) bins before the account
   // outgrows Solana's 10240-byte inner-instruction realloc cap (InvalidRealloc). Wider
@@ -57,22 +97,161 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   // funds fine. The exact ceiling between those is unmeasured, so cap conservatively.
   // Override with --maxBins once a higher value is known to work.
   const MAX_BINS = Math.min(+arg('maxBins', String(CFG.MAX_BINS)), DLMMImport.MAX_BINS_PER_POSITION?.toNumber?.() ?? 1400);
-  const maxHalf = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
-  const wanted = Math.max(3, Math.round(widthPct / binStepPct));
-  const widthBins = Math.min(wanted, maxHalf);
-  const effPct = (widthBins * binStepPct).toFixed(1);
-  if (widthBins < wanted) console.log(`width clamped: ±${widthPct}% = ${wanted} bins exceeds the ${MAX_BINS}-bin max -> using ${widthBins} bins (±${effPct}%)`);
-  const totalBins = mode === 'single' ? widthBins + 1 : 2*widthBins + 1;
+  if (!Number.isInteger(MAX_BINS) || MAX_BINS < 2 || !Number.isFinite(size) || size <= 0) throw new Error('invalid size or max-bin budget');
+  const bidAskPctPlan = hybrid ? (pendingBidAsk ? Number(pendingBidAsk.bidAskPct) : +arg('bidAskPct')) : null;
+  if (hybrid && (!Number.isFinite(bidAskPctPlan) || bidAskPctPlan <= 0 || bidAskPctPlan >= 100)) {
+    throw new Error('invalid --bidAskPct (both BID ASK and Spot legs must receive principal)');
+  }
+  let widthBins, totalBins, effPct, wanted;
+  if (hybrid) {
+    if (!pendingBidAsk && size > CFG.SIZE_BID_ASK + 1e-9) throw new Error(`BID ASK total ${size} SOL exceeds SIZE_BID_ASK=${CFG.SIZE_BID_ASK}`);
+    const depthPct = pendingBidAsk ? pendingBidAsk.depthPct : +arg('depthPct', String(widthPct));
+    const range = GATES.downsideRange({ depthPct, binStepBps, maxBins: MAX_BINS });
+    if (!range.executable) {
+      throw new Error(`BID ASK ${depthPct}% depth needs ${range.totalBins || '?'} bins at ${binStepBps}bps, above MAX_BINS=${MAX_BINS}; refusing to shorten the accumulation range`);
+    }
+    widthBins = range.requiredBins;
+    totalBins = range.totalBins;
+    effPct = range.effectiveDepthPct;
+    if (pendingBidAsk && (pendingBidAsk.minBinId == null || pendingBidAsk.maxBinId == null
+        || pendingBidAsk.maxBinId - pendingBidAsk.minBinId !== widthBins)) {
+      throw new Error('pending BID ASK range does not match current pool geometry/config');
+    }
+  } else {
+    const planned = GATES.tradeRange({ widthPct, binStepBps, maxBins: MAX_BINS, mode });
+    if (!planned) throw new Error('invalid trade width/bin step');
+    const explicitBins = arg('widthBins', null);
+    if (explicitBins != null) {
+      const parsed = Number(explicitBins);
+      const maxWidth = mode === 'single' ? MAX_BINS - 1 : Math.floor((MAX_BINS - 1) / 2);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > maxWidth) throw new Error(`invalid --widthBins ${explicitBins}`);
+      widthBins = parsed;
+      totalBins = mode === 'single' ? widthBins + 1 : 2 * widthBins + 1;
+      effPct = 100 * (1 - Math.pow(1 + binStepBps / 10_000, -widthBins));
+      wanted = planned.requestedBins;
+    } else {
+      widthBins = planned.widthBins; totalBins = planned.totalBins;
+      effPct = planned.effectiveWidthPct; wanted = planned.requestedBins;
+    }
+    if (widthBins < wanted) console.log(`width clamped: requested ${widthPct}% needs ${wanted} bins, ${MAX_BINS}-bin max ships ${widthBins} bins (${effPct.toFixed(1)}% downside)`);
+  }
   const extended = totalBins > DEF_BINS;
   // Rent scales with width past the default: POSITION_MIN_SIZE + 112B per extra bin.
   // Refunded on close, but it locks capital, so charge it to the affordability check.
   const acctSize = (DLMMImport.POSITION_MIN_SIZE ?? 8112) + Math.max(0, totalBins - DEF_BINS) * (DLMMImport.POSITION_BIN_DATA_SIZE ?? 112);
   const rent = (await conn.getMinimumBalanceForRentExemption(acctSize)) / 1e9;
   const bal = await conn.getBalance(user.publicKey);
-  const need = size + rent + CFG.FEE_BUFFER_SOL; // + bin array init and gas headroom
-  console.log(`plan: ${label} ${mode} ${size} SOL on ${pool.name} width ±${effPct}% (${totalBins} bins${extended?', extended':''}) rent ${rent.toFixed(4)} tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
-  if (bal/1e9 < need) { console.error(`INSUFFICIENT: need ${need.toFixed(4)} SOL (${size} position + ${rent.toFixed(4)} rent + ${CFG.FEE_BUFFER_SOL} fees), have ${(bal/1e9).toFixed(4)}`); process.exit(2); }
+  const createDone = pendingBidAsk?.phases?.create?.status === 'confirmed';
+  const remainingPrincipal = pendingBidAsk ? remainingPrincipalLamports(pendingBidAsk) / 1e9 : size;
+  const rentNeeded = createDone ? 0 : rent;
+  const need = remainingPrincipal + rentNeeded + CFG.FEE_BUFFER_SOL;
+  const band = hybrid ? `0%..-${effPct.toFixed(1)}%` : `${mode === 'single' ? '' : '±'}${effPct.toFixed(1)}% downside`;
+  console.log(`plan: ${label} ${mode} ${size} SOL total on ${pool.name} range ${band} (${totalBins} bins${extended?', extended':''}) rent ${rent.toFixed(4)} tp ${tp} sl ${sl} stopPrice ${stopPrice} | wallet ${bal/1e9} SOL`);
+  // A resumed submitted signature is reconciled before affordability is checked:
+  // otherwise a leg that landed just before a crash is counted and charged twice.
+  if (!pendingBidAsk && bal/1e9 < need) { console.error(`INSUFFICIENT: need ${need.toFixed(4)} SOL (${remainingPrincipal} remaining principal + ${rentNeeded.toFixed(4)} rent + ${CFG.FEE_BUFFER_SOL} fees), have ${(bal/1e9).toFixed(4)}`); process.exit(2); }
   if (DRY) { console.log('DRY RUN OK'); return; }
+
+  if (hybrid) {
+    if (!pendingBidAsk) {
+      const active = await dlmm.getActiveBin();
+      const posKp = Keypair.generate();
+      const bidAskPct = bidAskPctPlan;
+      const spotPct = 100 - bidAskPct;
+      pendingBidAsk = makeBidAskJournal({
+        pool: POOL, poolName: pool.name, mint: MINT, owner: user.publicKey.toBase58(),
+        position: posKp.publicKey.toBase58(), positionSecret: Array.from(posKp.secretKey),
+        sizeLamports: Math.floor(size * 1e9), bidAskPct, spotPct,
+        depthPct: +arg('depthPct', String(widthPct)), anchorBinId: active.binId,
+        minBinId: active.binId - widthBins, maxBinId: active.binId,
+        totalBins, extended, entryPrice: pool.current_price,
+        entryFeeRate: Number(pool.fee_tvl_ratio?.['1h']) * 24,
+        entryFeeRate24h: Number(pool.fee_tvl_ratio?.['24h']),
+      });
+      writeJsonAtomic(BID_ASK_PENDING, pendingBidAsk);
+    }
+    if (pendingBidAsk.pool !== POOL || pendingBidAsk.mint !== MINT
+        || pendingBidAsk.owner !== user.publicKey.toBase58()) {
+      throw new Error('pending BID ASK journal does not match pool, mint, or wallet');
+    }
+    const positionKey = new PublicKey(pendingBidAsk.position);
+    const positionSigner = pendingBidAsk.positionSecret
+      ? Keypair.fromSecretKey(Uint8Array.from(pendingBidAsk.positionSecret)) : null;
+    let phaseDlmm = dlmm;
+    const phaseState = () => pendingBidAsk.phases.spot.status === 'confirmed' ? 'COMPLETE'
+      : pendingBidAsk.phases.bidAsk.status === 'confirmed' ? 'BIDASK_CONFIRMED'
+        : pendingBidAsk.phases.create.status === 'confirmed' ? 'CREATED' : 'PENDING_CREATE';
+    const recordHybrid = () => {
+      if (pendingBidAsk.phases.create.status !== 'confirmed') return;
+      const rows = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
+      const row = {
+        pool: POOL, name: pendingBidAsk.poolName, mint: MINT, position: pendingBidAsk.position,
+        label: 'BID_ASK', profile: 'ACCUM', strategy: 'Bid-Ask + Spot', mode: 'single', shape: 'hybrid',
+        sizeSOL: pendingBidAsk.sizeLamports / 1e9, bidAskPct: pendingBidAsk.bidAskPct, spotPct: pendingBidAsk.spotPct,
+        depthPct: pendingBidAsk.depthPct, entryPrice: pendingBidAsk.entryPrice,
+        entryFeeRate: pendingBidAsk.entryFeeRate, entryFeeRate24h: pendingBidAsk.entryFeeRate24h,
+        tpPct: 0, slPct: 0, stopPrice: 0,
+        minBinId: pendingBidAsk.minBinId, maxBinId: pendingBidAsk.maxBinId,
+        funded: phaseState() === 'COMPLETE', deploymentState: phaseState(),
+        openedAt: new Date(pendingBidAsk.createdAt).toISOString(),
+      };
+      const i = rows.findIndex(r => r.position === row.position);
+      if (i >= 0) rows[i] = { ...rows[i], ...row }; else rows.push(row);
+      writeJsonAtomic(__dirname+'/positions.json', rows);
+    };
+    recordHybrid();
+    await runBidAskPhases(pendingBidAsk, {
+      retryFailed: RETRY_FAILED,
+      save: async (j) => { writeJsonAtomic(BID_ASK_PENDING, j); },
+      reconcile: async (phase) => reconcileSubmitted(conn, phase, confirmSig),
+      validate: async (phase) => {
+        phaseDlmm = await DLMM.create(conn, new PublicKey(POOL));
+        const x = phaseDlmm.lbPair?.tokenXMint?.toBase58?.() || phaseDlmm.tokenX?.publicKey?.toBase58?.();
+        const y = phaseDlmm.lbPair?.tokenYMint?.toBase58?.() || phaseDlmm.tokenY?.publicKey?.toBase58?.();
+        if (x !== MINT || y !== SOLM) throw new Error('on-chain pool mints changed during BID ASK deploy');
+        if (phase !== 'create') {
+          const [position, active] = await Promise.all([phaseDlmm.getPosition(positionKey), phaseDlmm.getActiveBin()]);
+          validateFundingRange(pendingBidAsk, {
+            lowerBinId: position.positionData.lowerBinId,
+            upperBinId: position.positionData.upperBinId,
+          }, active.binId);
+        }
+        const remaining = remainingPrincipalLamports(pendingBidAsk) / 1e9;
+        const phaseRent = phase === 'create' ? rent : 0;
+        const currentBalance = (await conn.getBalance(user.publicKey)) / 1e9;
+        const required = remaining + phaseRent + CFG.FEE_BUFFER_SOL;
+        if (currentBalance < required) {
+          throw new Error(`BID ASK resume needs ${required.toFixed(4)} SOL (${remaining} remaining principal + ${phaseRent.toFixed(4)} rent + buffer), have ${currentBalance.toFixed(4)}`);
+        }
+      },
+      build: async (phase) => {
+        if (phase === 'create') {
+          if (!positionSigner) throw new Error('pending create is missing its position signer');
+          return extended
+            ? phaseDlmm.createExtendedEmptyPosition(pendingBidAsk.minBinId, pendingBidAsk.maxBinId, positionKey, user.publicKey)
+            : phaseDlmm.createEmptyPosition({ positionPubKey: positionKey, minBinId: pendingBidAsk.minBinId, maxBinId: pendingBidAsk.maxBinId, user: user.publicKey });
+        }
+        const spec = phaseLiquidity(pendingBidAsk, phase, StrategyType);
+        return phaseDlmm.addLiquidityByStrategy({
+          positionPubKey: positionKey, user: user.publicKey,
+          totalXAmount: new BN(0), totalYAmount: new BN(String(spec.yLamports)),
+          strategy: { minBinId: spec.minBinId, maxBinId: spec.maxBinId, strategyType: spec.strategyType },
+          slippage: 3,
+        });
+      },
+      send: async (tx, phase, beforeSend) => sendConfirm(conn, tx,
+        phase === 'create' ? [user, positionSigner] : [user], `BID ASK ${phase}`,
+        { beforeSend, retryExpired: false }),
+      onConfirmed: async (phase) => {
+        recordHybrid();
+        console.log(`BID ASK ${phase} confirmed:`, pendingBidAsk.phases[phase].signature);
+      },
+    });
+    recordHybrid();
+    fs.rmSync(BID_ASK_PENDING, { force: true });
+    console.log('DEPLOYED:', pendingBidAsk.position, `bins ${pendingBidAsk.minBinId}..${pendingBidAsk.maxBinId}`, '| BID ASK + Spot confirmed, registry updated');
+    return;
+  }
   let totalX = new BN(0);
   let swapSOL = mode === 'two' ? size/2 : 0;
   // DELTA ACCOUNTING: deposit exactly what THIS deploy's swap buys - never the
@@ -163,7 +342,9 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   }
   if (mode === 'two' && totalX.isZero()) throw new Error('two-sided deploy with zero token side - refusing to open a mislabeled one-sided position');
   const solSide = mode === 'two' ? size/2 : size;
-  const dlmm = await DLMM.create(conn, new PublicKey(POOL));
+  // Refresh pool state after a potentially slow Jupiter swap so the standard
+  // position anchors to the current active bin.
+  dlmm = await DLMM.create(conn, new PublicKey(POOL));
   const active = await dlmm.getActiveBin();
   const minBinId = mode === 'single' ? active.binId - widthBins : active.binId - widthBins;
   const maxBinId = mode === 'single' ? active.binId : active.binId + widthBins;
@@ -219,10 +400,12 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   // for the extended path (unfunded right after create, then funded after the add leg).
   function record({ funded }) {
     const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
-    const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, mode,
+    const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, profile, mode,
       sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
       entryFeeRate24h: pool.fee_tvl_ratio['24h']||0,   // the pool's NORMAL level (spike-bias guard for FEE-DECAY)
-      tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded, openedAt: new Date().toISOString() , shape: arg('shape','spot') };
+      tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded,
+      widthBins, widthPct: effPct, edgeModel: 'pool-width heuristic; shape and execution costs unmodeled',
+      openedAt: new Date().toISOString() , shape: arg('shape','spot') };
     const i = reg.findIndex(r => r.position === row.position);
     if (i >= 0) reg[i] = { ...reg[i], ...row }; else reg.push(row);
     fs.writeFileSync(__dirname+'/positions.json', JSON.stringify(reg, null, 1));

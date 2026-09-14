@@ -37,15 +37,16 @@ node calibrate.cjs         # per-class stats from trades.json; propose-only
 - `bins.cjs` is a hardcoded-pool debug scratchpad; `binscore.cjs` is the real tool.
 - Monitoring: `tail -f daemon.log` (scan verdicts), `tail -f events.log` (deploys/exits/failures).
 
-## Verifying changes (no tests or CI exist)
+## Verifying changes
 
-1. `npm run lint` — ESLint, correctness rules only (config in `eslint.config.cjs`; no style rules by design). Errors block, warnings are informational.
-2. `node screen.cjs` — smoke test (needs `RPC_URL` + `JUP_API_KEY`, no wallet key).
-3. `node deploy.cjs ... --dry` — exercises the deploy path up to (not including) the swap.
-4. `node replay.cjs` — validate signal/gate changes against logged observations (cached in `replay-cache.json`).
-5. `node calibrate.cjs` — real-trade outcomes per class.
+1. `npm test` — mock-only strategy, transaction, geometry, and recovery regressions; does not load the wallet or start trading.
+2. `npm run lint` — ESLint, correctness rules only (config in `eslint.config.cjs`; no style rules by design). Errors block, warnings are informational.
+3. `node screen.cjs` — smoke test (needs `RPC_URL` + `JUP_API_KEY`, no wallet key).
+4. `node deploy.cjs ... --dry` — exercises the deploy path up to (not including) transactions, but still loads config/keypair and makes network requests.
+5. `node replay.cjs` — validate TRADE signal/gate changes against logged observations (cached in `replay-cache.json`); BID ASK/ACCUM is excluded until its hybrid inventory model exists.
+6. `node calibrate.cjs` — real-trade outcomes per class; ACCUM results are descriptive and never produce TP/SL proposals.
 
-**Known drift:** `screen.cjs` hardcodes its TVL/volume/top-N thresholds and its IGNITION/BASING gate expressions as copies of the daemon's — tuning `.env` gates does NOT affect it, and gate edits must be made in both files or they diverge.
+`screen.cjs` and the daemon share strategy gates through `gates.cjs`. The preview still owns its top-N/TVL/volume candidate filters, so changes to those filters must be mirrored deliberately.
 
 ## Config
 

@@ -1,7 +1,7 @@
 {
   "name": "dlmm-quant",
-  "version": "0.2.0",
-  "description": "Autonomous quant LP trading daemon for Meteora DLMM: IL-breakeven screener, organic-flow gates, path labels, auto deploy/manage/exit",
+  "version": "0.3.0",
+  "description": "Automated Meteora DLMM signal, deployment, management, and exit daemon",
   "license": "MIT",
   "scripts": {
     "start": "node trader_daemon.cjs",
@@ -10,7 +10,8 @@
     "exit": "node exit.cjs",
     "bins": "node binscore.cjs",
     "swap": "node jupswap.cjs",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "node --test tests/*.test.cjs"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.5.4",

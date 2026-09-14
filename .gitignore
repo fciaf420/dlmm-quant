@@ -21,6 +21,8 @@ trades.json
 shadow.jsonl
 replay-cache.json
 .pending-swap.json
+.pending-bid-ask.json
+.pending-bid-ask.json.tmp
 
 # launchwatch observer output (not the daemon)
 launchwatch.jsonl

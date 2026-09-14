@@ -1,64 +1,107 @@
-// screen.cjs — read-only preview board. Universe filters and gate verdicts come
-// from config.cjs + gates.cjs — the SAME code the daemon deploys by — so the
-// board can no longer drift from the live rules. (Before 2026-08-07 it carried
-// hand-retyped copies: hardcoded 60k/150k/top-8, no SOL-quote filter, no
-// tight-base gate, and no CARRY/SQUEEZE classes at all — it could show setups
-// the daemon would refuse and hide ones it trades.)
-// SQUEEZE persistence is read from daemon_state.json (the daemon's own stored
-// trailing-sigma ratios, same-source entries only); with no daemon state on
-// disk it simply reports none.
-const { JUP_KEY: JK, CFG } = require("./config.cjs");
-const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
-const GATES = require("./gates.cjs");
-const fs = require("fs");
+// Read-only preview of the same trade and BID ASK engine the daemon executes.
+const { JUP_KEY: JK, CFG } = require('./config.cjs');
+const { fetchVolDay, sigmaFrom } = require('./vol.cjs');
+const GATES = require('./gates.cjs');
+const fs = require('fs');
+
+const metric = (v) => (v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))) ? Number(v) : null;
+const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
+
 (async () => {
-  const bd = await (await fetch("https://dlmm.datapi.meteora.ag/pools?sort_by=volume_24h:desc&page_size=100")).json();
-  // same universe as the daemon: TVL/vol floors + quote-mint filter (deploy can't ship anything else)
-  const B = (bd.data||bd).filter(p=>(p.tvl||0)>=CFG.MIN_TVL && (p.volume?.["24h"]||0)>=CFG.MIN_VOL_24H && p.token_y?.address===CFG.QUOTE_MINT);
-  B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
-  B.sort((a,b)=>b._fr-a._fr);
+  const boardResponse = await fetch('https://dlmm.datapi.meteora.ag/pools?sort_by=volume_24h:desc&page_size=100');
+  if (!boardResponse.ok) throw new Error(`pool board ${boardResponse.status}`);
+  const bd = await boardResponse.json();
+  const boardTs = Date.now();
+  const B = (bd.data || bd).filter(p => Number(p.tvl) >= CFG.MIN_TVL
+    && Number(p.volume?.['24h']) >= CFG.MIN_VOL_24H
+    && p.token_x?.address && p.token_x.address !== CFG.QUOTE_MINT
+    && p.token_y?.address === CFG.QUOTE_MINT);
+  B.forEach(p => {
+    const f1 = metric(p.fee_tvl_ratio?.['1h']);
+    const base = metric(p.pool_config?.base_fee_pct);
+    const v30 = metric(p.volume?.['30m']), v4 = metric(p.volume?.['4h']);
+    p._fr = f1 == null ? null : f1 * 24;
+    p._fr24 = metric(p.fee_tvl_ratio?.['24h']);
+    p._sg = metric(p.dynamic_fee_pct) == null || base == null || base <= 0 ? null : metric(p.dynamic_fee_pct) / base;
+    p._ac = v30 == null || v4 == null ? null : (v30 * 48) / Math.max(v4 * 6, 1);
+  });
+  B.sort((a, b) => (b._fr ?? -Infinity) - (a._fr ?? -Infinity));
+
   let hist = {};
-  try { hist = JSON.parse(fs.readFileSync(__dirname+'/daemon_state.json','utf8')).history || {}; } catch(e){}
+  try { hist = JSON.parse(fs.readFileSync(__dirname + '/daemon_state.json', 'utf8')).history || {}; } catch (e) {}
+  const tokenCache = new Map();
+  const tokenFor = async (mint) => {
+    if (!tokenCache.has(mint)) tokenCache.set(mint,
+      fetch(`https://api.jup.ag/tokens/v2/search?query=${mint}`, { headers: { 'x-api-key': JK } })
+        .then(async response => ({ response: response.ok ? await response.json() : null, ts: Date.now() })));
+    const hit = await tokenCache.get(mint);
+    const token = Array.isArray(hit.response)
+      ? hit.response.find(x => (x.id || x.address || x.mint) === mint) || null : null;
+    return { token, ts: hit.ts };
+  };
+
   const R = [];
   for (const p of B.slice(0, CFG.SCAN_TOP_N)) {
     try {
-      const tk = await (await fetch(`https://api.jup.ag/tokens/v2/search?query=${p.token_x.address}`, { headers:{'x-api-key':JK} })).json();
-      const t = Array.isArray(tk)?tk[0]:null; if(!t) continue;
-      const ageH = t.createdAt ? (Date.now()-new Date(t.createdAt).getTime())/3600000 : 999;
-      const pc5=t.stats5m?.priceChange||0, pc1=t.stats1h?.priceChange||0, pc24=t.stats24h?.priceChange||0;
-      const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
-      const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
-      let dd=null, pos=null, low=null, low6h=null, rv=null;
-      try { const vd = await fetchVolDay(p.address); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
-      const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);   // RV primary, legacy fallback
-      // MIN_SIGMA universe gate - keep in sync with trader_daemon.cjs scan()
-      if (sigma < CFG.MIN_SIGMA) continue;
-      const edge = GATES.edgeFrom(p._fr, sigma);
-      const path = GATES.classifyPath({ pc5, pc1, dd, pos });
-      // squeeze persistence: last two same-source ratios the daemon recorded, both <= 0.6
-      const hs = (hist[p.token_x.address]||[]).filter(x=>x.src===(rv!=null?'rv':'lg'));
-      const r2 = hs.slice(-2).map(x=>x.ratio);
-      const sqzPersist = r2.length===2 && r2.every(x=>x!=null && x<=0.6);
+      const tokenHit = await tokenFor(p.token_x.address);
+      const t = tokenHit.token; if (!t) continue;
+      const ageH = t.createdAt ? (Date.now() - new Date(t.createdAt).getTime()) / 3600e3 : 999;
+      const pc5 = metric(t.stats5m?.priceChange), pc1 = metric(t.stats1h?.priceChange), pc24 = metric(t.stats24h?.priceChange);
+      const buy1 = metric(t.stats1h?.buyOrganicVolume), sell1 = metric(t.stats1h?.sellOrganicVolume);
+      const buy6 = metric(t.stats6h?.buyOrganicVolume), sell6 = metric(t.stats6h?.sellOrganicVolume);
+      const ofi = buy1 == null || sell1 == null ? null : sell1 / Math.max(buy1, 1);
+      const ofi6 = buy6 == null || sell6 == null ? null : sell6 / Math.max(buy6, 1);
+      let dd = null, pos = null, low = null, low6h = null, rv = null;
+      try { const vd = await fetchVolDay(p.address); ({ rv, dd, pos, low, low6h } = vd); } catch (e) {}
+      const legacyReady = pc5 != null && pc1 != null && (ageH < 24 || pc24 != null);
+      const sigma = rv != null ? sigmaFrom(rv, ageH, pc5 || 0, pc1 || 0, pc24 || 0)
+        : legacyReady ? sigmaFrom(null, ageH, pc5, pc1, pc24 || 0) : null;
+      if (sigma == null || sigma < CFG.MIN_SIGMA) continue;
+      const path = pc5 == null || pc1 == null ? 'UNKNOWN' : GATES.classifyPath({ pc5, pc1, dd, pos });
       const px = Number(p.current_price) || 0;
-      const { rawW } = GATES.basingFloor({ px, low, low6h });
-      R.push({ addr:p.address, name:p.name, tvl:p.tvl, fr:p._fr, edge, surge:p._sg, accel:p._ac, ofi, ofi6,
-        org:t.organicScore||0, dd, pos, pc5, pc1, path, ageH, sigma, audit:t.audit||{}, rawW, sqzPersist });
-      await new Promise(r=>setTimeout(r,140));
-    } catch(e){}
+      const audit = t.audit || {};
+      const dataTs = Math.min(boardTs, tokenHit.ts);
+      const evaluated = GATES.collectSignals({
+        now: Date.now(),
+        data: {
+          ok: true, ts: dataTs, supportedSolPair: true,
+          feeRate1h: p._fr, feeRate24h: p._fr24, sigma,
+          surge: p._sg, accel: p._ac, org: metric(t.organicScore), orgBuy1h: buy1,
+          path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit, px, low, low6h, dd,
+          binStepBps: Number(p.pool_config?.bin_step),
+        },
+        config: {
+          maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR,
+          sizeIgnition: CFG.SIZE_IGNITION, sizeIgnitionHi: CFG.SIZE_IGNITION_HI,
+          sizeBasing: CFG.SIZE_BASING, sizeCarry: CFG.SIZE_CARRY, sizeBidAsk: CFG.SIZE_BID_ASK,
+        },
+      });
+      const hs = (hist[p.token_x.address] || []).filter(x => x.src === (rv != null ? 'rv' : 'lg'));
+      const r2 = hs.slice(-2).map(x => x.ratio);
+      const compression = r2.length === 2 && r2.every(x => x != null && x <= 0.6);
+      R.push({
+        addr: p.address, name: p.name, tvl: Number(p.tvl), fr: p._fr,
+        edge: evaluated.trade ? evaluated.trade.edge : (evaluated.recipeEdges.IGNITION || 0), surge: p._sg, accel: p._ac,
+        ofi, ofi6, org: metric(t.organicScore), dd, pos, pc5, pc1, path, ageH, sigma,
+        evaluated, compression,
+      });
+      await new Promise(r => setTimeout(r, 140));
+    } catch (e) {}
   }
-  R.sort((a,b)=>b.edge-a.edge);
-  console.log("run:", new Date().toISOString());
-  console.log("pool | TVL$k | fee%/d | EDGE | surge | accel | OFI | org | dd% | rngPos | 5m% | 1h% | PATH");
-  for(const r of R) console.log(`${r.name} | ${Math.round(r.tvl/1000)} | ${r.fr.toFixed(1)} | ${r.edge.toFixed(2)} | ${r.surge.toFixed(2)} | ${r.accel.toFixed(2)} | ${r.ofi.toFixed(2)} | ${Math.round(r.org)} | ${r.dd!=null?Math.round(r.dd):null} | ${r.pos!=null?r.pos.toFixed(2):null} | ${r.pc5.toFixed(1)} | ${r.pc1.toFixed(1)} | ${r.path} | https://www.meteora.ag/dlmm/${r.addr}`);
-  const ign = R.filter(r=>GATES.ignition({ edge:r.edge, sg:r.surge, ac:r.accel, org:r.org, path:r.path, ageH:r.ageH, ofi:r.ofi }));
-  const basAll = R.filter(r=>GATES.basing({ path:r.path, ofi:r.ofi, org:r.org, fr:r.fr, edge:r.edge }));
-  const bas = basAll.filter(r=>r.rawW <= CFG.BASING_MAX_FLOOR);
-  const basBlocked = basAll.filter(r=>r.rawW > CFG.BASING_MAX_FLOOR);
-  const car = R.filter(r=>GATES.carry({ edge:r.edge, ofi6:r.ofi6, org:r.org, tvl:r.tvl, fr:r.fr, sigma:r.sigma, ageH:r.ageH, audit:r.audit, path:r.path }));
-  const sqz = R.filter(r=>GATES.squeeze({ sqzPersist:r.sqzPersist, path:r.path, pos:r.pos, ofi:r.ofi, org:r.org, ageH:r.ageH, tvl:r.tvl, fr:r.fr }));
-  console.log("\nIGNITION:", ign.length?JSON.stringify(ign.map(r=>r.name)):"none");
-  console.log("BASING SETUP:", bas.length?JSON.stringify(bas.map(r=>r.name)):"none");
-  if (basBlocked.length) console.log("  basing blocked by tight-base gate:", JSON.stringify(basBlocked.map(r=>`${r.name} floor ${r.rawW.toFixed(0)}% > ${CFG.BASING_MAX_FLOOR}%`)));
-  console.log("CARRY:", car.length?JSON.stringify(car.map(r=>r.name)):"none");
-  console.log("SQUEEZE:", sqz.length?JSON.stringify(sqz.map(r=>r.name)):"none");
-})();
+
+  R.sort((a, b) => b.edge - a.edge);
+  console.log('run:', new Date().toISOString());
+  console.log('pool | TVL$k | fee%/d | EDGE@recipe | surge | accel | OFI | org | dd% | rngPos | 5m% | 1h% | PATH');
+  for (const r of R) console.log(`${r.name} | ${Math.round(r.tvl / 1000)} | ${show(r.fr, 1)} | ${show(r.edge)} | ${show(r.surge)} | ${show(r.accel)} | ${show(r.ofi)} | ${r.org == null ? '?' : Math.round(r.org)} | ${r.dd != null ? Math.round(r.dd) : '?'} | ${show(r.pos)} | ${show(r.pc5, 1)} | ${show(r.pc1, 1)} | ${r.path} | https://www.meteora.ag/dlmm/${r.addr}`);
+  const trades = R.filter(r => r.evaluated.trade);
+  for (const label of ['IGNITION', 'BASING', 'CARRY']) {
+    const rows = trades.filter(r => r.evaluated.trade.label === label);
+    console.log(`${label}:`, rows.length ? JSON.stringify(rows.map(r => r.name)) : 'none');
+  }
+  const bidAsk = R.filter(r => r.evaluated.bidAsk);
+  const capacity = R.filter(r => r.evaluated.bidAskStatus?.ready && !r.evaluated.bidAskStatus.executable);
+  console.log('BID ASK READY:', bidAsk.length ? JSON.stringify(bidAsk.map(r => `${r.name} ${r.evaluated.bidAsk.bidAskPct}/${r.evaluated.bidAsk.spotPct} 0..-${r.evaluated.bidAsk.depthPct}%`)) : 'none');
+  if (capacity.length) console.log('BID ASK CAPACITY WAIT:', JSON.stringify(capacity.map(r => `${r.name} needs ${r.evaluated.bidAskStatus.range?.totalBins || '?'} bins > ${CFG.MAX_BINS}`)));
+  const compression = R.filter(r => r.compression);
+  console.log('COMPRESSION (diagnostic only; no SQUEEZE entry):', compression.length ? JSON.stringify(compression.map(r => r.name)) : 'none');
+})().catch(e => { console.error('ERR', e.message); process.exit(1); });

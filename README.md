@@ -1,7 +1,7 @@
 # dlmm-quant
 
 **An autonomous market-making bot for [Meteora DLMM](https://meteora.ag) on Solana.**
-It scans every liquid pool, does the math a market maker would do, enters only when the fees genuinely overpay for the risk, manages the position against hard rules, and always exits back to SOL. One process, no UI, no babysitting.
+It scans the configured top-volume pool universe, evaluates explicit signal rules, deploys through Meteora, and manages each position by its saved strategy profile. One process, no UI.
 
 ```bash
 git clone https://github.com/fciaf420/dlmm-quant && cd dlmm-quant
@@ -20,23 +20,23 @@ npm start              # go live
 
 When you LP a DLMM pool, you're not "earning yield" — **you're selling insurance against price movement**. Fees are the premium you collect; impermanent loss is the claim you pay out when price actually moves. Most LPs never check whether the premium covers the claims.
 
-This bot only enters when it does. For a position of width `W`, the expected daily IL from price wobble is roughly:
+The TRADE profiles use this pool-level screening approximation for a position of width `W`:
 
 ```
 expected IL/day ≈ σ² / 8W        (σ = realized volatility, %/day)
 ```
 
-So there's a hard breakeven: **fees/day must beat σ²/8W**. The bot expresses every pool as a single number:
+This gives the TRADE screener a fee-versus-volatility comparison:
 
 ```
 edge = (net fee rate / σ)  ÷  (1.3 × σ / 8W)
 ```
 
-`edge ≥ 1.0` means the fees clear expected IL with a 30% margin. Below 1, you're a charity for traders. A pool paying 40%/day in fees *sounds* incredible — but if the token swings 200%/day, edge is ~0.1 and the bot won't touch it. That single filter kills most "hot pool" traps.
+`edge ≥ 1.0` is the configured heuristic threshold. It is not a profit forecast. The model does not include exact bin shape, directional inventory, swap/priority fees, slippage, rewards, or position-specific fill path. BID ASK is an accumulation profile and does not use this symmetric TRADE proxy.
 
 Two properties of edge worth internalizing:
 
-- **It scales linearly with width `W`.** The same pool quotes differently at ±20% than at ±35%, so a width the bot can't actually deploy produces a meaningless number. Widths are capped by the pool's bin budget *before* brackets are derived.
+- **It scales linearly with width `W`.** The gate now uses the geometric width represented by the bins the recipe will actually deploy. A requested width that is narrowed by the bin budget no longer receives credit for the wider setting.
 - **It scales inversely with σ².** A vol estimate 20% too low inflates edge by ~56%. Which is why σ is measured, not guessed:
 
 ## σ — measured, not guessed
@@ -47,7 +47,7 @@ Realized volatility comes from actual price candles, in a three-tier quality lad
 2. **Parkinson** — for pools under ~35 minutes old. Estimates vol from each candle's high-low *range*, which carries ~5x more information per candle, so it works from just 3.
 3. **Legacy single-print estimator** — last resort under ~15 minutes. Both noisy *and* biased: it systematically under-reads vol on calm prints, which inflates edge exactly when you least want it.
 
-Readings are tagged by source, and the SQUEEZE detector only ever compares same-source readings — a change of measuring stick must never look like a change in the market.
+Readings are tagged by source. Volatility compression remains a same-source diagnostic; it is not an entry signal.
 
 If σ falls back to the legacy estimator on 2+ *mature* tokens in one scan, candle data is broken, every edge that cycle was computed on a bad instrument, and **the bot logs `DEGRADED SIGMA` and refuses to deploy that cycle.** It doesn't trade on data it doesn't trust.
 
@@ -63,7 +63,7 @@ If σ falls back to the legacy estimator on 2+ *mature* tokens in one scan, cand
 | **OFI** | Are *organic* wallets (Jupiter filters out bots) net buying or net selling? Don't be someone's exit liquidity | Jupiter |
 | **path** | Where is price in its recent story? Labels each pool `FREEFALL / BASING / BLOWOFF / GRIND-UP / CHOP` | OHLCV |
 
-## The four plays
+## The automated profiles
 
 **🔥 IGNITION** — an event-driven scalp. Fees clear the bar (edge ≥ 1) *and* the fee accumulator is surged *and* volume is accelerating. Never fires into a FREEFALL (huge fees during a crash are bait). Width scales with σ; brackets are computed from the pool's own vol and fee rate.
 
@@ -73,27 +73,34 @@ The band's **bottom is placed *on* the consolidation floor** (the recent 5-minut
 
 **🛡 CARRY** — boring on purpose. Mature token (3+ days), mint & freeze authority burned, big TVL, calm price, organic buyers on the 6-hour window, decent persistent fees. Wide ±35% range, rides for days. The fee floor is tiered: thin yield is only acceptable when risk-adjusted quality is exceptional.
 
-**🌀 SQUEEZE** — the long-vol wing. σ has compressed to ≤60% of its own trailing median for two consecutive scans (data-gated: needs ≥6 readings spanning ≥45min). Deploys **Bid-Ask** shape — liquidity loaded at the band edges — with width derived from the *trailing* σ, i.e. the vol it coils back to, not the compressed reading. **This is the one play with no edge gate**, because edge measures fee-vs-IL at *current* vol and low current vol is the entire thesis. A 24h time-stop closes coils that never spring.
+**🪣 BID ASK** — a quote-only accumulation profile. It is surfaced independently, so the same pool may show both a TRADE class and BID ASK. READY requires a fresh, complete snapshot; a non-SOL token X quoted in wrapped SOL token Y; mint and freeze authority disabled; top-holder concentration ≤35%; positive organic buy volume; 24h fee rate ≥8%/day with the 1h rate at least half of that; and no unbought FREEFALL (`OFI ≥1.43`). These are uncalibrated strategy priors, not evidence of profitability.
+
+The requested band runs from the active bin down 60–75%, with depth mapped from σ and drawdown. Total principal is split 60–80% **BidAsk** and the remainder **Spot**, both added as SOL/token-Y to the same position and the same fixed bin IDs. `SIZE_BID_ASK=1` is the total across both layers. Deep widths use DLMM's geometric bin spacing; if the full range needs more than `MAX_BINS`, the bot reports `CAPACITY WAIT` and does not substitute a shallower trade.
+
+Execution keeps the existing TRADE family first when both profiles qualify. BID ASK is eligible for deployment when no executable TRADE remains; among BID ASK candidates, the scanner keeps its fee-rate/input order rather than treating geometric bin rounding as a profitability score.
+
+Existing SQUEEZE rows remain TRADE positions and retain their saved exits/time-stop. New volatility-compression observations are diagnostic only: passive Bid-Ask liquidity does not provide a generic long-vol payoff that wins on either breakout direction.
 
 ### Cap-aware take-profits
 
-A two-sided band's maximum price-driven gain is exactly **W/4** — above the band you're 100% SOL and done. Everything beyond that must come from accumulated fees. TPs are computed against that cap rather than set optimistically, so a TP the bot shows is a number the position can actually reach. Pump-outs get booked by the out-of-range rule, not by TP.
+In the replay's simplified uniform two-sided payoff model, price-driven gain approaches a cap near **W/4** once inventory has converted to SOL. The TRADE recipes use that approximation to avoid setting brackets far beyond their modeled band payoff. Actual reachability still depends on DLMM bin shape, fill path, fees, slippage, and costs; pump-outs are normally booked by the out-of-range rule.
 
 ## The lifecycle
 
 ```
-every ~14 min  SCAN    100 pools → filters → signals → 4 gates
+every ~14 min  SCAN    top-volume board → filters → shared profile gates
                         (cadence is configurable)
                  │
-on signal      DEPLOY  Jupiter swap for the token side (exact delta accounting)
-                        → open position via Meteora SDK → verify the on-chain
-                        bin range matches the order → record entry, brackets,
-                        and fee baselines in positions.json
+on signal      DEPLOY  TRADE: Jupiter swap + one Meteora position
+                        BID ASK: create one fixed range → confirmed BidAsk layer
+                        → confirmed Spot layer; each phase is journaled before send
                  │
-every 2 min    MANAGE  each open position against its own brackets:
+every 2 min    MANAGE  each open position against its saved profile:
                         ✓ take-profit           ✓ stop-loss / structural stop
                         ✓ out-of-range          ✓ fee-decay
-                        ✓ flow-flip             ✓ squeeze time-stop
+                        ✓ flow-flip             ✓ legacy squeeze time-stop
+                        BID ASK: WAIT on either fee decay or distribution;
+                        EXIT only when both are true on current valid data
                  │
 on trigger     EXIT    close 100% → sweep every token to SOL → journal the
                         round trip to trades.json
@@ -101,7 +108,7 @@ on trigger     EXIT    close 100% → sweep every token to SOL → journal the
                repeat  (2h re-entry cooldown per pool)
 ```
 
-**Everything always ends in SOL.** No bags.
+While held, BID ASK deliberately accumulates token inventory and can become fully token-side. Its exit rule is separate from scalp TP/SL; when that rule fires, the existing exit path closes the LP and sweeps token inventory back to SOL.
 
 ### The exit rules, in detail
 
@@ -110,6 +117,8 @@ on trigger     EXIT    close 100% → sweep every token to SOL → journal the
 - **Flow-flip** — organic sellers >3:1 while price drops >15%/hour. Real wallets are exiting through your bid.
 - **Structural stop** — the price level that invalidates the thesis (for BASING, the base itself).
 - **Squeeze time-stop** — a coil that hasn't sprung in 24h isn't going to; stop paying rent.
+
+For `profile: ACCUM`, TP, SL, structural-stop, FREEFALL, and out-of-range exits do not apply. Fee decay must persist for two distinct valid snapshots, and the bot exits only when that decay and hard organic distribution are both present. If fee or organic-flow inputs are missing, management reports `DATA_WAIT` and does not infer zero. A position whose first layer is still deploying is resumed before ordinary management and is never mistaken for an external close during indexer lag.
 
 Out-of-range is computed from **the bot's own recorded bin range**, not the indexer's flag — a position's true range is something it ordered and verified, not something it needs to be told.
 
@@ -131,7 +140,7 @@ COOLDOWN_H=2
 # sizing, in SOL
 MAX_POSITIONS=2
 SIZE_IGNITION=0.3       SIZE_IGNITION_HI=0.4    # HI used when edge ≥ 2
-SIZE_BASING=0.3         SIZE_CARRY=0.4          SIZE_SQUEEZE=0.3
+SIZE_BASING=0.3         SIZE_CARRY=0.4          SIZE_BID_ASK=1
 
 # exit rulebook
 FEE_DECAY_FRAC=0.5      # exit below this fraction of the entry fee rate…
@@ -142,7 +151,7 @@ SQZ_TIMEOUT_H=24
 BASING_MAX_FLOOR=25     # BASING needs a floor within this % of price
 
 # per-class bracket overrides (SL positive; 0 = use the class formula)
-TP_IGNITION= SL_IGNITION= TP_BASING= SL_BASING= TP_CARRY= SL_CARRY= TP_SQUEEZE= SL_SQUEEZE=
+TP_IGNITION= SL_IGNITION= TP_BASING= SL_BASING= TP_CARRY= SL_CARRY=
 ```
 
 Bracket overrides apply at **deploy time** and are stamped into the registry, so changes affect new positions only — what you entered on is what you're managed by.
@@ -155,7 +164,7 @@ Two analysis tools, both propose-only — neither ever edits config.
 
 ### `node calibrate.cjs` — what actually happened
 
-Reads `trades.json` (every closed round trip, with the class, entry fee baseline, brackets, and exit trigger), lazily settles official SOL-denominated PnL from Meteora's closed-position rollup, and prints per-class exit-trigger distributions and PnL percentiles. At **n ≥ 20 per class** it proposes TP/SL values (p75 of winners, p90 of losses) for you to review and apply via `.env`.
+Reads `trades.json` (every closed round trip, with the class, entry fee baseline, brackets, and exit trigger), lazily settles official SOL-denominated PnL from Meteora's closed-position rollup, and prints per-class exit-trigger distributions and PnL percentiles. At **n ≥ 20 per TRADE class** it proposes TP/SL values (p75 of winners, p90 of losses) for you to review and apply via `.env`. ACCUM outcomes remain descriptive because its lifecycle has no TP/SL brackets.
 
 Reading the trigger mix is half the value: `TP` heavy means brackets are working; `FEE-DECAY` dominant means fees are the real exit and TP is set too far; `OOR-UP` heavy means pump-outs are booking the cap.
 
@@ -165,7 +174,7 @@ The scanner evaluates ~8 pools every scan and, without this, throws every reject
 
 Instead, every evaluation (signal *or* rejection) is appended to `shadow.jsonl` with all its inputs, at **zero extra API cost** — it's data already in hand. `replay.cjs` then simulates each observation forward against the pool's **real price path** (30m candles) and **real fee series**, applies the daemon's own exit rules, and caches results permanently.
 
-Output is an edge → outcome calibration curve per class: bucket, n, win rate, mean PnL, trigger mix — plus a suggested entry gate (the lowest bucket clearing measured friction at n ≥ 10) and a **near-miss audit** comparing setups blocked *only* by surge/accel against full passes. That last one answers a question nothing else can: are those gates saving you money or deleting opportunity?
+Output is an edge → outcome calibration curve per TRADE class: bucket, n, win rate, mean PnL, trigger mix — plus a suggested entry gate (the lowest bucket clearing measured friction at n ≥ 10) and a **near-miss audit** comparing setups blocked *only* by surge/accel against full passes. BID ASK rows are explicitly excluded until the replay models its two-shape inventory and conjunctive exit lifecycle.
 
 Hundreds of labeled observations per day, versus a handful of real trades per week. It also ingests `shadow-*.jsonl` exports from the companion [Meteora Quant Lens](https://github.com/fciaf420/meteora-quant-lens) extension, deduped.
 
@@ -179,17 +188,21 @@ Hundreds of labeled observations per day, versus a handful of real trades per we
 - **Degraded-data suppression** — a scan cycle whose vol data is untrustworthy deploys nothing
 - **Exact swap-delta accounting** — deposits only what *this* deploy's swap bought, never the wallet's total balance of that mint, so pre-existing holdings can't be swept into a bot position
 - **Crash-safe swaps** — a swap that succeeds but whose position fails journals its output; the retry reuses those exact tokens instead of buying again
+- **Crash-safe BID ASK phases** — the deterministic signature is journaled before each broadcast; restart reconciliation checks transaction history before any retry, and the position/range never regenerates between layers
 - **Blockhash-expiry retry** — heavy position-opens get 3 attempts with fresh blockhashes (expiry means nothing executed, so re-signing is safe)
 - **Rate-limit retry** — Jupiter 429s back off and retry rather than killing the deploy
 - **Range verification** — an extended position whose on-chain bin range doesn't match the order is *never funded*; the unfunded position stays registered so its rent is recoverable
 - **External-close detection** — close a position by hand and the daemon notices, journals it, and cleans its registry
 - Keys never leave your machine; everything reads from `.env` (gitignored)
 
+If a partial BID ASK deployment must be abandoned, stop the daemon first. Reconcile every submitted signature so none remains ambiguous, close the partial position and confirm that cleanup on-chain, then archive or remove `.pending-bid-ask.json`. Deleting the journal before those steps removes the executor's idempotency record.
+
 ## CLI reference
 
 ```bash
 npm start                                # the daemon
-npm run screen                           # one-shot scan: every pool, every signal, every verdict
+npm run screen                           # one-shot preview of the configured top candidate set
+npm test                                 # mock-only strategy/recovery regression tests
 node calibrate.cjs                       # per-class results from real trades
 node replay.cjs [--max 150]              # entry-gate calibration curves from shadow observations
 node binscore.cjs <POOL> <VOL%/day>      # bin-crowding map — see where other LPs AREN'T
@@ -197,6 +210,8 @@ node binscore.cjs <POOL> <VOL%/day>      # bin-crowding map — see where other 
                                          #  path of price pays you 10-50x a crowded one)
 node deploy.cjs --pool <P> --size 0.3 --mode two --widthPct 18 --tp 20 --sl -15 --label MANUAL
 node deploy.cjs ... --dry                # plan only, no transactions
+node deploy.cjs --resume                 # resume/reconcile an interrupted BID ASK deployment
+node deploy.cjs --resume --retry-failed  # explicit retry after a confirmed on-chain failure
 node exit.cjs --pool <P>                 # close all positions in pool, sweep to SOL
 node jupswap.cjs <inMint> <outMint> <rawAmount>
 node pnlhunt.cjs --pair X-SOL --binStep N --baseFee N --duration hh:mm:ss --pnl P  # identify the wallet behind a PnL card
@@ -217,6 +232,7 @@ Scan lines, deploys, and exits all print a clickable `meteora.ag/dlmm/<pool>` li
 | `events.log` | every deploy/exit/failure, with the actual error text |
 | `daemon.log` | heartbeat + every scan verdict with reasons |
 | `.pending-swap.json` | crash-recovery ledger for a swap whose position didn't land |
+| `.pending-bid-ask.json` | ignored local journal for the fixed position, allocation, and transaction phases of one hybrid deploy |
 
 ## Identifying the wallet behind a PnL card (`pnlhunt.cjs`)
 
@@ -260,11 +276,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dlmm.quant-trader.pl
 
 ## Companion project
 
-**[Meteora Quant Lens](https://github.com/fciaf420/meteora-quant-lens)** — a read-only Chrome extension running the *same* signal engine (identical σ ladder, edge math, class gates, and exit rules) as an overlay on Meteora's own UI. It alerts and journals instead of executing. Useful for watching the board without running a daemon, for manual entries that still get rule-based exit alerts, and its shadow-log export feeds this repo's `replay.cjs`.
+**[Meteora Quant Lens](https://github.com/fciaf420/meteora-quant-lens)** — a read-only Chrome extension using the same BID ASK eligibility, depth/allocation mapping, σ ladder, and profile lifecycle as an overlay on Meteora's UI. It guides wallet-approved entries; this repository can execute the signal automatically through its configured size and position limits.
 
 ## Honest limitations
 
 - The IL formula is a diffusion approximation, not exact bin math
+- EDGE is a pool/width heuristic. It does not model the deployed shape, directional inventory, per-bin competition, rewards, swap/priority fees, slippage, or transaction/rent opportunity cost. BID ASK has no profitability model or validated backtest in this release
+- A BID ASK layer validates that every saved bin is at or below the active bin immediately before building, but the SDK transaction permits bounded active-bin movement while it lands. A downward move can pause the next layer; the journal remains for later resume or manual close
 - Replay simulation is ranking-grade, not penny-grade: uniform-band payoff approximation, 30-minute exit granularity vs the daemon's 2-minute ticks, no execution costs, and same-pool observations overlap in time so `n` runs optimistic
 - Several bracket and gate constants are principled but **not yet backtested** — they're structured priors, and the two analysis tools exist precisely to replace them with evidence from your own trade log
 - Class sample sizes accumulate slowly: ~98% of evaluations produce no signal, which is the system working, but it means calibration takes weeks not days
