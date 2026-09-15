@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node trader_daemon.cjs",
     "screen": "node screen.cjs",
+    "candles": "node candle-analysis.cjs",
     "deploy": "node deploy.cjs",
     "exit": "node exit.cjs",
     "bins": "node binscore.cjs",

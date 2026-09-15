@@ -20,6 +20,8 @@ STOP
 trades.json
 shadow.jsonl
 replay-cache.json
+candle_evidence.json
+candle_evidence.json.tmp
 .pending-swap.json
 .pending-bid-ask.json
 .pending-bid-ask.json.tmp

@@ -2,6 +2,8 @@
 const { JUP_KEY: JK, CFG } = require('./config.cjs');
 const { fetchVolDay, sigmaFrom } = require('./vol.cjs');
 const GATES = require('./gates.cjs');
+const { createCandleDiagnostics } = require('./candle_diagnostics.cjs');
+const { refreshBidAskCandidates } = require('./bidask_runtime.cjs');
 const fs = require('fs');
 
 const metric = (v) => (v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))) ? Number(v) : null;
@@ -40,6 +42,7 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
     return { token, ts: hit.ts };
   };
 
+  const candleDiagnostics = createCandleDiagnostics({ maxPerBatch: 2, maxPools: 2 });
   const R = [];
   for (const p of B.slice(0, CFG.SCAN_TOP_N)) {
     try {
@@ -51,8 +54,8 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
       const buy6 = metric(t.stats6h?.buyOrganicVolume), sell6 = metric(t.stats6h?.sellOrganicVolume);
       const ofi = buy1 == null || sell1 == null ? null : sell1 / Math.max(buy1, 1);
       const ofi6 = buy6 == null || sell6 == null ? null : sell6 / Math.max(buy6, 1);
-      let dd = null, pos = null, low = null, low6h = null, rv = null;
-      try { const vd = await fetchVolDay(p.address); ({ rv, dd, pos, low, low6h } = vd); } catch (e) {}
+      let dd = null, pos = null, low = null, low6h = null, rv = null, recentCandles = [];
+      try { const vd = await fetchVolDay(p.address); ({ rv, dd, pos, low, low6h, recentCandles = [] } = vd); } catch (e) {}
       const legacyReady = pc5 != null && pc1 != null && (ageH < 24 || pc24 != null);
       const sigma = rv != null ? sigmaFrom(rv, ageH, pc5 || 0, pc1 || 0, pc24 || 0)
         : legacyReady ? sigmaFrom(null, ageH, pc5, pc1, pc24 || 0) : null;
@@ -61,21 +64,19 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
       const px = Number(p.current_price) || 0;
       const audit = t.audit || {};
       const dataTs = Math.min(boardTs, tokenHit.ts);
-      const evaluated = GATES.collectSignals({
-        now: Date.now(),
-        data: {
-          ok: true, ts: dataTs, supportedSolPair: true,
-          feeRate1h: p._fr, feeRate24h: p._fr24, sigma,
-          surge: p._sg, accel: p._ac, org: metric(t.organicScore), orgBuy1h: buy1,
-          path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit, px, low, low6h, dd,
-          binStepBps: Number(p.pool_config?.bin_step),
-        },
-        config: {
-          maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR,
-          sizeIgnition: CFG.SIZE_IGNITION, sizeIgnitionHi: CFG.SIZE_IGNITION_HI,
-          sizeBasing: CFG.SIZE_BASING, sizeCarry: CFG.SIZE_CARRY, sizeBidAsk: CFG.SIZE_BID_ASK,
-        },
-      });
+      const scanData = {
+        address: p.address, ok: true, ts: dataTs, supportedSolPair: true,
+        feeRate1h: p._fr, feeRate24h: p._fr24, sigma,
+        surge: p._sg, accel: p._ac, org: metric(t.organicScore), orgBuy1h: buy1,
+        path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit, px, low, low6h, dd,
+        binStepBps: Number(p.pool_config?.bin_step),
+      };
+      const signalConfig = {
+        maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR,
+        sizeIgnition: CFG.SIZE_IGNITION, sizeIgnitionHi: CFG.SIZE_IGNITION_HI,
+        sizeBasing: CFG.SIZE_BASING, sizeCarry: CFG.SIZE_CARRY, sizeBidAsk: CFG.SIZE_BID_ASK,
+      };
+      const evaluated = GATES.collectSignals({ now: Date.now(), data: scanData, config: signalConfig });
       const hs = (hist[p.token_x.address] || []).filter(x => x.src === (rv != null ? 'rv' : 'lg'));
       const r2 = hs.slice(-2).map(x => x.ratio);
       const compression = r2.length === 2 && r2.every(x => x != null && x <= 0.6);
@@ -83,11 +84,39 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
         addr: p.address, name: p.name, tvl: Number(p.tvl), fr: p._fr,
         edge: evaluated.trade ? evaluated.trade.edge : (evaluated.recipeEdges.IGNITION || 0), surge: p._sg, accel: p._ac,
         ofi, ofi6, org: metric(t.organicScore), dd, pos, pc5, pc1, path, ageH, sigma,
-        evaluated, compression,
+        evaluated, compression, poolCreatedAt: p.created_at, recentCandles,
+        data: scanData, config: signalConfig, dataTs, mint: p.token_x.address, pool: p,
       });
       await new Promise(r => setTimeout(r, 140));
     } catch (e) {}
   }
+
+  // Match the daemon's execution order: TRADE gets first refusal. If no trade
+  // is available, refresh at most two deduplicated BID ASK histories before
+  // rendering this read-only preview; the rest remain WATCH/deferred for the
+  // daemon's persistent rotation.
+  const bidAskCandidates = R.filter(r => r.evaluated.bidAskStatus?.baseReady).map(r => ({
+    address: r.addr, mint: r.mint, p: r.pool, name: r.name,
+    poolCreatedAt: r.poolCreatedAt, recentCandles: r.recentCandles,
+    data: r.data, config: r.config, dataTs: r.dataTs,
+    bidAskStatus: r.evaluated.bidAskStatus,
+  }));
+  const nowBeforeBidAsk = Date.now();
+  const hasFreshTrade = R.some(r => r.evaluated.trade && Number.isFinite(r.dataTs)
+    && nowBeforeBidAsk >= r.dataTs && nowBeforeBidAsk - r.dataTs <= GATES.BID_ASK_FRESH_MS);
+  if (!hasFreshTrade && bidAskCandidates.length) {
+    const refreshed = await refreshBidAskCandidates(bidAskCandidates, {
+      diagnostics: candleDiagnostics, collectSignals: GATES.collectSignals, max: 2,
+      nowMs: () => Date.now(),
+    });
+    for (const candidate of refreshed.refreshed) {
+      const row = R.find(r => r.addr === candidate.address);
+      if (!row) continue;
+      row.evaluated = candidate.evaluated || row.evaluated;
+      row.candle = candleDiagnostics.get(row.addr);
+    }
+  }
+  for (const r of R) if (!r.candle) r.candle = candleDiagnostics.get(r.addr);
 
   R.sort((a, b) => b.edge - a.edge);
   console.log('run:', new Date().toISOString());
@@ -98,10 +127,28 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
     const rows = trades.filter(r => r.evaluated.trade.label === label);
     console.log(`${label}:`, rows.length ? JSON.stringify(rows.map(r => r.name)) : 'none');
   }
-  const bidAsk = R.filter(r => r.evaluated.bidAsk);
-  const capacity = R.filter(r => r.evaluated.bidAskStatus?.ready && !r.evaluated.bidAskStatus.executable);
-  console.log('BID ASK READY:', bidAsk.length ? JSON.stringify(bidAsk.map(r => `${r.name} ${r.evaluated.bidAsk.bidAskPct}/${r.evaluated.bidAsk.spotPct} 0..-${r.evaluated.bidAsk.depthPct}%`)) : 'none');
+  const bidAskEntries = R.map(r => ({
+    p: r.pool, mint: r.mint, dataTs: r.dataTs,
+    sig: r.evaluated.bidAsk,
+    bidAskStatus: r.evaluated.bidAskStatus,
+    candleAnalysis: r.evaluated.bidAsk?.candleAnalysis || r.evaluated.bidAskStatus?.candleAnalysis,
+  }));
+  const bidAsk = GATES.selectBidAskCandidates(bidAskEntries, { nowMs: Date.now() });
+  const capacity = R.filter(r => r.evaluated.bidAskStatus?.baseReady
+    && r.evaluated.bidAskStatus.range?.executable === false);
+  console.log('BID ASK READY:', bidAsk.length ? JSON.stringify(bidAsk.map(r => `${r.p.name} ${r.sig.bidAskPct}/${r.sig.spotPct} 0..-${r.sig.depthPct}%`)) : 'none');
   if (capacity.length) console.log('BID ASK CAPACITY WAIT:', JSON.stringify(capacity.map(r => `${r.name} needs ${r.evaluated.bidAskStatus.range?.totalBins || '?'} bins > ${CFG.MAX_BINS}`)));
+  const candleRows = R.filter(r => r.evaluated.bidAskStatus?.baseReady);
+  console.log('CANDLE EVIDENCE (bounded preview: two BID ASK histories refreshed before selection; remaining candidates WATCH/deferred):');
+  for (const r of candleRows) {
+    const c = r.candle;
+    if (!c || !['READY', 'LIMITED'].includes(c.state)) {
+      console.log(`  ${r.name}: ${c?.state || 'NOT_COLLECTED'}${c?.reason ? ` (${c.reason})` : ''}`);
+    } else {
+      const matured = c.matured ? `${c.recovered}/${c.matured} recovered` : 'no matured outcomes';
+      console.log(`  ${r.name}: ${c.state} ${c.hours}h | dips ${c.total}: ${matured}, ${c.timedOut} timed out, ${c.pending} pending | median depth ${c.medianDepthPct ?? 'n/a'}% | median recovery ${c.medianRecoveryMinutes ?? 'n/a'}m | drawdown ${c.currentDrawdownPct}% | total-volume ratio ${c.recentVolumeRatio ?? 'n/a'}x`);
+    }
+  }
   const compression = R.filter(r => r.compression);
   console.log('COMPRESSION (diagnostic only; no SQUEEZE entry):', compression.length ? JSON.stringify(compression.map(r => r.name)) : 'none');
 })().catch(e => { console.error('ERR', e.message); process.exit(1); });

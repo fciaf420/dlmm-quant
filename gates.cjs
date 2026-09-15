@@ -4,6 +4,8 @@
 // Extracted from the daemon so the read-only board cannot drift from execution.
 // Numbers here are the daemon's real thresholds — editing them changes LIVE deploys.
 
+const { qualifyBidAskCandle } = require('./candle_analysis.cjs');
+
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 
 // FREEFALL / BASING / BLOWOFF / GRIND-UP / CHOP from price action + day structure
@@ -123,7 +125,9 @@ function bidAskSignal(d, now = Date.now()) {
       && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h,
     path: knownPath && finite(d.ofi1h) && !(d.path === 'FREEFALL' && d.ofi1h >= 1.43),
   };
-  const ready = Object.values(gates).every(Boolean);
+  const baseReady = Object.values(gates).every(Boolean);
+  const candleQualification = qualifyBidAskCandle(d.candleAnalysis, { nowMs: now });
+  const ready = baseReady && candleQualification.ready;
   let depthPct = null;
   let bidAskPct = null;
   if (finite(d.sigma) && d.sigma > 0) {
@@ -140,12 +144,19 @@ function bidAskSignal(d, now = Date.now()) {
     label: 'BID_ASK',
     profile: 'ACCUM',
     strategy: 'Bid-Ask + Spot',
-    state: ready ? 'READY' : 'WAIT',
+    state: ready ? 'READY' : (baseReady ? 'WATCH' : 'WAIT'),
     ready,
+    baseReady,
     heuristic: true,
     depthPct,
     allocation: bidAskPct == null ? null : { bidAskPct, spotPct: 100 - bidAskPct },
     gates,
+    candleQualification,
+    candleAnalysis: d.candleAnalysis || null,
+    reasons: [
+      ...Object.entries(gates).filter(([, pass]) => !pass).map(([key]) => key),
+      ...candleQualification.reasons,
+    ],
   };
 }
 
@@ -250,6 +261,7 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
     orgBuy1h: d.orgBuy1h, feeRate1h: d.feeRate1h, feeRate24h: d.feeRate24h,
     path: d.path, ofi1h: d.ofi, sigma: d.sigma, ddHigh: d.dd,
+    candleAnalysis: d.candleAnalysis,
   }, now);
   const baRange = ba.depthPct == null ? null
     : downsideRange({ depthPct: ba.depthPct, binStepBps: d.binStepBps, maxBins: c.maxBins });
@@ -262,16 +274,91 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
       wantedPct: ba.depthPct, size: c.sizeBidAsk,
       bidAskPct: ba.allocation.bidAskPct, spotPct: ba.allocation.spotPct,
       range: baRange, tp: 0, sl: 0, stop: 0,
+      ready: true, baseReady: ba.baseReady,
+      candleQualification: ba.candleQualification,
+      candleAnalysis: ba.candleAnalysis,
       edge: null, edgeModel: 'unvalidated accumulation heuristic; no position-specific profitability model',
     };
   }
   return out;
 }
 
+function selectBidAskCandidates(entries, options = {}) {
+  const now = finite(options.nowMs) ? options.nowMs : Date.now();
+  const candleReadyAtNow = (entry, signal, status) => {
+    const analysis = signal.candleAnalysis || entry.candleAnalysis || status.candleAnalysis;
+    return !!analysis && qualifyBidAskCandle(analysis, { nowMs: now }).ready;
+  };
+  const selected = [];
+  const seenMints = new Set();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const signal = entry && entry.sig;
+    if (!signal || signal.label !== 'BID_ASK') continue;
+    const dataTs = entry.dataTs;
+    if (!finite(dataTs) || now < dataTs || now - dataTs > BID_ASK_FRESH_MS) continue;
+    const status = entry.bidAskStatus || {};
+    if (signal.ready !== true || !candleReadyAtNow(entry, signal, status)) continue;
+    const capacityFit = signal.executable !== false
+      && status.executable !== false
+      && (!signal.range || signal.range.executable !== false)
+      && (!status.range || status.range.executable !== false);
+    if (!capacityFit) continue;
+    const rawMint = entry.mint ?? entry.p?.token_x?.address ?? entry.p?.mint ?? entry.p?.address;
+    const mint = String(rawMint || '');
+    if (seenMints.has(mint)) continue;
+    seenMints.add(mint);
+    selected.push(entry);
+  }
+  return selected;
+}
+
+function selectBidAskHistoryCandidates(entries, options = {}) {
+  const max = Number.isInteger(options.max) && options.max > 0 ? options.max : 2;
+  const now = finite(options.nowMs) ? options.nowMs : Date.now();
+  const candleReadyAtNow = (entry) => {
+    const signal = entry?.sig || entry?.evaluated?.bidAsk;
+    const analysis = signal?.candleAnalysis || entry?.candleAnalysis
+      || entry?.bidAskStatus?.candleAnalysis;
+    return !!analysis && qualifyBidAskCandle(analysis, { nowMs: now }).ready;
+  };
+  const groups = new Map();
+  let groupIndex = 0;
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const status = entry && entry.bidAskStatus;
+    if (!status || status.baseReady !== true) continue;
+    const rawMint = entry.mint ?? entry.p?.token_x?.address ?? entry.p?.mint ?? entry.p?.address;
+    const mint = String(rawMint || '');
+    if (!groups.has(mint)) groups.set(mint, { entries: [], index: groupIndex++ });
+    groups.get(mint).entries.push(entry);
+  }
+  const selected = [];
+  const orderedGroups = [...groups.values()].map((group) => {
+    const qualified = group.entries.find((entry) => entry.bidAskStatus?.ready === true
+      && entry.bidAskStatus?.executable === true
+      && entry.bidAskStatus?.range?.executable === true
+      && candleReadyAtNow(entry));
+    const fit = qualified || group.entries.find((entry) => entry.bidAskStatus?.range?.executable === true);
+    return {
+      fit,
+      qualified: !!qualified,
+      collectedAt: fit ? Number(fit.candleCollectedAt || 0) : 0,
+      index: group.index,
+    };
+  }).filter((group) => group.fit);
+  orderedGroups.sort((a, b) => Number(b.qualified) - Number(a.qualified)
+    || a.collectedAt - b.collectedAt || a.index - b.index);
+  for (const group of orderedGroups) {
+    const fit = group.fit;
+    if (fit) selected.push(fit);
+    if (selected.length >= max) break;
+  }
+  return selected;
+}
+
 function selectExecutionSignal(entries) {
   const all = Array.isArray(entries) ? entries : [];
   const trades = all.filter(x => x && x.sig && x.sig.label !== 'BID_ASK');
-  if (!trades.length) return all.find(x => x && x.sig && x.sig.label === 'BID_ASK') || null;
+  if (!trades.length) return selectBidAskCandidates(all)[0] || null;
   const ratio = (x) => x.sig.widthPct / (x.sig.wantedPct || x.sig.widthPct || 1);
   return trades.slice().sort((a, b) => ratio(b) - ratio(a))[0] || null;
 }
@@ -280,6 +367,6 @@ module.exports = {
   classifyPath, edgeFrom, ignition, basing, basingFloor, carry,
   downsideRange, tradeRange, bidAskSignal, resolvePositionProfile,
   needsDeploymentResume, evaluateAccumLifecycle, signalsReady, updateFeeDecay, collectSignals,
-  selectExecutionSignal,
+  selectBidAskCandidates, selectBidAskHistoryCandidates, selectExecutionSignal,
   BID_ASK_FRESH_MS,
 };

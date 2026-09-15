@@ -5,6 +5,8 @@ const DIR = __dirname;
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
 const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
 const GATES = require("./gates.cjs");   // shared with screen.cjs — edit gates THERE, not inline
+const { createCandleDiagnostics } = require('./candle_diagnostics.cjs');
+const { refreshBidAskCandidates } = require('./bidask_runtime.cjs');
 const SOLM = CFG.QUOTE_MINT;
 const WALLET = keypair().publicKey.toBase58();
 const MET = "https://dlmm.datapi.meteora.ag";
@@ -44,6 +46,15 @@ const hb = (m) => { console.log(`${new Date().toTimeString().slice(0,8)} ${m}`);
 // Scan progress: indented, goes to both stdout and daemon.log so the terminal
 // shows what's being evaluated instead of sitting silent for ~15s.
 const sc = (m) => { console.log(`         ${m}`); log(m); };
+// BID ASK history is refreshed synchronously for at most two deduplicated,
+// capacity-fitting candidates when no TRADE will deploy. Remaining base-ready
+// candidates stay WATCH and rotate through the deferred descriptive collector.
+const candleDiagnostics = createCandleDiagnostics({
+  cacheFile: DIR + '/candle_evidence.json',
+  maxPools: 8,
+  maxPerBatch: 2,
+  onError: error => { try { log(`candle diagnostic err: ${error?.message || error}`); } catch (e) {} },
+});
 // First gate a candidate fails, so a rejection is legible at a glance.
 // (log text only — thresholds mirror gates.cjs ignition(); keep in sync when tuning)
 function blocker(edge, sg, ac, org, path, ageH, ofi){
@@ -269,6 +280,7 @@ async function scan(){
   B.sort((a,b)=>(b._fr??-Infinity)-(a._fr??-Infinity));
   let best = null;
   const sigs = [];        // all qualifying signals this cycle (bin-aware selection below)
+  const bidAskCandidates = []; // base-ready candidates awaiting candle qualification
   let degradedSigma = 0;  // legacy-sigma fallbacks on mature (>1h) tokens this cycle
   const cands = B.slice(0, CFG.SCAN_TOP_N);
   // Sibling pools share token metadata. Coalesce one Jupiter lookup per mint for
@@ -303,8 +315,8 @@ async function scan(){
       const buy1=metric(t.stats1h?.buyOrganicVolume), sell1=metric(t.stats1h?.sellOrganicVolume);
       const buy6=metric(t.stats6h?.buyOrganicVolume), sell6=metric(t.stats6h?.sellOrganicVolume);
       // RV sigma from 5m OHLCV (one call also yields dd/pos/low below); legacy fallback for thin data
-      let dd=null,pos=null,low=null,low6h=null,rv=null;
-      try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
+      let dd=null,pos=null,low=null,low6h=null,rv=null,recentCandles=[];
+      try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; recentCandles=vd.recentCandles||[]; } catch(e){}
       const legacyReady = pc5 != null && pc1 != null && (ageH < 24 || pc24 != null);
       const sigma = rv != null ? sigmaFrom(rv, ageH, pc5 || 0, pc1 || 0, pc24 || 0)
         : legacyReady ? sigmaFrom(null, ageH, pc5, pc1, pc24 || 0) : null;
@@ -344,20 +356,18 @@ async function scan(){
       const px = Number(p.current_price) || 0;
       const { rawW } = GATES.basingFloor({ px, low, low6h });
       const dataTs = Math.min(boardTs, tokenHit.ts);
-      const evaluated = GATES.collectSignals({
-        now: Date.now(),
-        data: {
-          ok: true, ts: dataTs, supportedSolPair: true,
-          feeRate1h: p._fr, feeRate24h: p._fr24, sigma, surge: p._sg, accel: p._ac,
-          org, orgBuy1h: buy1, path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit,
-          px, low, low6h, dd, binStepBps: Number(p.pool_config?.bin_step),
-        },
-        config: {
-          maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR,
-          sizeIgnition: CFG.SIZE_IGNITION, sizeIgnitionHi: CFG.SIZE_IGNITION_HI,
-          sizeBasing: CFG.SIZE_BASING, sizeCarry: CFG.SIZE_CARRY, sizeBidAsk: CFG.SIZE_BID_ASK,
-        },
-      });
+      const scanData = {
+        address: p.address, ok: true, ts: dataTs, supportedSolPair: true,
+        feeRate1h: p._fr, feeRate24h: p._fr24, sigma, surge: p._sg, accel: p._ac,
+        org, orgBuy1h: buy1, path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit,
+        px, low, low6h, dd, binStepBps: Number(p.pool_config?.bin_step),
+      };
+      const signalConfig = {
+        maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR,
+        sizeIgnition: CFG.SIZE_IGNITION, sizeIgnitionHi: CFG.SIZE_IGNITION_HI,
+        sizeBasing: CFG.SIZE_BASING, sizeCarry: CFG.SIZE_CARRY, sizeBidAsk: CFG.SIZE_BID_ASK,
+      };
+      const evaluated = GATES.collectSignals({ now: Date.now(), data: scanData, config: signalConfig });
       if (evaluated.trade?.label === 'IGNITION') {
         if (CFG.TP_IGNITION) evaluated.trade.tp = CFG.TP_IGNITION;
         if (CFG.SL_IGNITION) evaluated.trade.sl = -CFG.SL_IGNITION;
@@ -368,15 +378,23 @@ async function scan(){
         if (CFG.TP_CARRY) evaluated.trade.tp = CFG.TP_CARRY;
         if (CFG.SL_CARRY) evaluated.trade.sl = -CFG.SL_CARRY;
       }
-      const poolSignals = [evaluated.trade, evaluated.bidAsk].filter(Boolean);
+      const poolSignals = [evaluated.trade].filter(Boolean);
+      if (evaluated.bidAskStatus?.baseReady) bidAskCandidates.push({
+        address: p.address, mint: p.token_x.address, p, name: p.name,
+        poolCreatedAt: p.created_at, recentCandles, data: scanData,
+        config: signalConfig, dataTs,
+        bidAskStatus: evaluated.bidAskStatus, evaluated,
+      });
       const edge = evaluated.recipeEdges.IGNITION || 0;
       const compressed = sqzPersist ? ` compression ${sigmaRatio.toFixed(2)} diagnostic-only` : '';
-      const baBlocked = evaluated.bidAskStatus?.ready && !evaluated.bidAskStatus.executable
+      const baBlocked = evaluated.bidAskStatus?.baseReady
+        && evaluated.bidAskStatus.range?.executable === false
         ? `; BID ASK capacity wait ${evaluated.bidAskStatus.range?.totalBins || '?'}>${CFG.MAX_BINS} bins` : '';
       const show = (v, digits=2) => v == null ? '?' : v.toFixed(digits);
       const tradeBlock = [p._sg,p._ac,org,ofi].some(v=>v==null) || path === 'UNKNOWN'
         ? 'trade inputs incomplete' : blocker(edge,p._sg,p._ac,org,path,ageH,ofi);
-      sc(`${n}${compressed} edge@recipe ${edge.toFixed(2).padStart(5)} surge ${show(p._sg)} accel ${show(p._ac)} ofi ${show(ofi)}/${show(ofi6)} org ${org == null ? '?' : String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${poolSignals.length ? '=> '+poolSignals.map(x=>x.label).join('+') : '-- '+tradeBlock}${baBlocked}  https://www.meteora.ag/dlmm/${p.address}`);
+      const bidAskLabel = evaluated.bidAskStatus?.baseReady ? ' +BID_WATCH' : '';
+      sc(`${n}${compressed} edge@recipe ${edge.toFixed(2).padStart(5)} surge ${show(p._sg)} accel ${show(p._ac)} ofi ${show(ofi)}/${show(ofi6)} org ${org == null ? '?' : String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${poolSignals.length ? '=> '+poolSignals.map(x=>x.label).join('+') : '-- '+tradeBlock}${bidAskLabel}${baBlocked}  https://www.meteora.ag/dlmm/${p.address}`);
       // SHADOW LOG: persist every evaluation (signal or not) for counterfactual replay.
       // Zero extra API calls - this is data already in hand. Review with: node replay.cjs
       try {
@@ -387,8 +405,13 @@ async function scan(){
           edgeModel: 'pool-width heuristic', recipeEdges: evaluated.recipeEdges,
           ofi: ofi == null ? null : +ofi.toFixed(2), ofi6: ofi6 == null ? null : +ofi6.toFixed(2), org: org == null ? null : Math.round(org), path, ageH: +ageH.toFixed(1),
           dd: dd != null ? Math.round(dd) : null, sig: evaluated.trade ? evaluated.trade.label : null, w: evaluated.trade ? evaluated.trade.widthPct : null,
-          bidAsk: evaluated.bidAskStatus?.ready ? (evaluated.bidAsk ? 'READY' : 'CAPACITY_WAIT') : null,
+          bidAsk: evaluated.bidAskStatus?.baseReady
+            ? (evaluated.bidAskStatus.ready
+              ? (evaluated.bidAsk ? 'READY' : 'CAPACITY_WAIT')
+              : 'WATCH')
+            : null,
           bidAskDepth: evaluated.bidAskStatus?.depthPct ?? null, profile: evaluated.trade ? 'TRADE' : null,
+          candle: candleDiagnostics.get(p.address),
           // widened 2026-08-08: every gate INPUT now persists, so rule variants can be
           // tested offline. Before this, squeeze ratios lived only in daemon_state's
           // rolling 40-entry window — the best-performing class had the least data —
@@ -401,6 +424,53 @@ async function scan(){
       for (const found of poolSignals) sigs.push({ p, sig: found, dataTs });
       await new Promise(r=>setTimeout(r,130));
       } catch(e){ log(`scan err ${p.name}: ${e.message}`); }
+  }
+  // Re-evaluate every cached full analysis first. A deferred refresh from the
+  // prior scan can already be current for this completed 5m bucket; using it
+  // prevents the fee-ordered prefix from monopolising the two synchronous
+  // history slots. The qualifier is recomputed at this scan's wall clock.
+  const cachedQualifiedMints = new Set();
+  for (const candidate of bidAskCandidates) {
+    const compact = candleDiagnostics.get(candidate.address);
+    candidate.candleCollectedAt = Number(compact?.collectedAt || 0);
+    const cachedAnalysis = candleDiagnostics.getAnalysis(candidate.address);
+    if (!cachedAnalysis) continue;
+    candidate.candleAnalysis = cachedAnalysis;
+    const cachedEvaluated = GATES.collectSignals({ now: Date.now(),
+      data: { ...candidate.data, candleAnalysis: cachedAnalysis }, config: candidate.config });
+    candidate.evaluated = cachedEvaluated;
+    candidate.bidAskStatus = cachedEvaluated.bidAskStatus;
+    if (cachedEvaluated.bidAsk) {
+      cachedQualifiedMints.add(candidate.mint);
+      sigs.push({ p: candidate.p, mint: candidate.mint, sig: cachedEvaluated.bidAsk,
+        bidAskStatus: cachedEvaluated.bidAskStatus, candleAnalysis: cachedAnalysis,
+        dataTs: candidate.dataTs });
+    }
+  }
+  // TRADE gets first refusal. Only when no fresh trade is available do we spend
+  // the caller's latency budget on at most two full BID ASK history refreshes.
+  const nowBeforeBidAsk = Date.now();
+  const freshTradeEntries = sigs.filter((entry) => entry.sig && entry.sig.label !== 'BID_ASK'
+    && Number.isFinite(entry.dataTs) && nowBeforeBidAsk >= entry.dataTs
+    && nowBeforeBidAsk - entry.dataTs <= GATES.BID_ASK_FRESH_MS);
+  if (!GATES.selectExecutionSignal(freshTradeEntries) && bidAskCandidates.length) {
+    const historyCandidates = bidAskCandidates.filter((candidate) => !cachedQualifiedMints.has(candidate.mint));
+    const refreshed = await refreshBidAskCandidates(historyCandidates, {
+      diagnostics: candleDiagnostics,
+      collectSignals: GATES.collectSignals,
+      max: 2,
+      nowMs: () => Date.now(),
+    });
+    for (const candidate of refreshed.refreshed) {
+      const evaluated = candidate.evaluated;
+      if (!evaluated || !evaluated.bidAsk) continue;
+      sigs.push({ p: candidate.p, mint: candidate.mint, sig: evaluated.bidAsk,
+        bidAskStatus: evaluated.bidAskStatus, candleAnalysis: candidate.candleAnalysis,
+        dataTs: candidate.dataTs });
+    }
+    for (const candidate of refreshed.deferred) {
+      sc(`BID ASK WATCH ${candidate.name || candidate.p?.name || candidate.address}: candle refresh deferred`);
+    }
   }
   // BIN-AWARE SELECTION: the same token often lists 3 pools (20/25/50/100bps) and
   // the finest bin step usually ranks first by fee rate - but it may not be able to
@@ -416,8 +486,15 @@ async function scan(){
   // Surface every actionable BID ASK independently even when an existing trade
   // class wins the one-deploy-per-scan selector.
   s.alerted = s.alerted || {};
-  for (const x of sigs.filter(x => x.sig.label === 'BID_ASK')) {
-    const key = `BID_ASK:${x.p.address}`;
+  // Re-run the complete gate at alert time. A cached READY analysis can cross
+  // the five-minute bucket boundary while the board/Jupiter fetches are in
+  // flight, and a status flag from the earlier scan must never keep it
+  // actionable. The helper also applies exact-mint deduplication and capacity
+  // checks for sibling pools.
+  const actionableBidAsks = GATES.selectBidAskCandidates(sigs, { nowMs: Date.now() });
+  for (const x of actionableBidAsks) {
+    const alertMint = x.mint ?? x.p?.token_x?.address ?? x.p?.mint ?? x.p?.address;
+    const key = `BID_ASK:${String(alertMint)}`;
     if (Date.now() - (s.alerted[key] || 0) >= 2*3600e3) {
       ev(`BID ASK READY ${x.p.name}: ${x.sig.size} SOL total, ${x.sig.bidAskPct}/${x.sig.spotPct} Bid-Ask+Spot, 0%..-${x.sig.depthPct}% (${x.sig.range.totalBins} bins)  https://www.meteora.ag/dlmm/${x.p.address}`);
       s.alerted[key] = Date.now();
@@ -426,7 +503,7 @@ async function scan(){
   if (sigs.length) {
     const head = sigs.find(x => x.sig.label !== 'BID_ASK') || sigs[0];
     best = GATES.selectExecutionSignal(sigs);
-    if (best.p.address !== head.p.address) {
+    if (best && best.p.address !== head.p.address) {
       sc(`bin-aware: preferring ${best.p.name} ${best.p.pool_config?.bin_step}bps (holds ±${best.sig.widthPct}% of ±${best.sig.wantedPct}% wanted) over ${head.p.name} ${head.p.pool_config?.bin_step}bps (only ±${head.sig.widthPct}%)`);
     }
   }
@@ -438,6 +515,17 @@ async function scan(){
   if (degradedSigma >= 2) {
     ev(`DEGRADED SIGMA: legacy fallback on ${degradedSigma} mature tokens this cycle (OHLCV data missing) - deploy suppressed`);
     best = null;
+  }
+  // A BID ASK signal can become stale during the final scan work. Revalidate
+  // the full candle qualification immediately before invoking deploy.cjs.
+  if (best?.sig?.label === 'BID_ASK') {
+    const freshBidAsk = GATES.selectBidAskCandidates([best], { nowMs: Date.now() });
+    if (!freshBidAsk.length) {
+      sc(`BID ASK skipped before deploy: candle evidence or market snapshot is stale for ${best.p.name}`);
+      best = null;
+    } else {
+      best = freshBidAsk[0];
+    }
   }
   if (best) {
     const { p, sig } = best;
@@ -455,6 +543,24 @@ async function scan(){
     } catch(e){ ev(`DEPLOY FAILED ${p.name}: ${String((e.stderr||'') + ' | ' + (e.stdout||'')).replace(/\s+/g,' ').slice(0,300) || String(e.message).slice(0,150)}`); }
   }
   saveSt(s);
+  // Remaining candidates are deliberately deferred: entry/exit timing stays
+  // independent of public OHLCV backfill, and collectedAt rotates the two-pool
+  // batch so a high-fee sibling cannot starve the rest of the board.
+  const deferredCandleCandidates = bidAskCandidates.map((candidate) => ({
+    address: candidate.address, name: candidate.name,
+    poolCreatedAt: candidate.poolCreatedAt, recentCandles: candidate.recentCandles,
+  }));
+  void candleDiagnostics.schedule(deferredCandleCandidates).then(rows => {
+    for (const row of rows) {
+      const c = row.evidence;
+      if (c.state !== 'READY' && c.state !== 'LIMITED') {
+        log(`candle evidence ${row.name}: ${c.state} (${c.reason || 'history unavailable'})`);
+        continue;
+      }
+      const outcomes = c.matured ? `${c.recovered}/${c.matured} recovered` : 'no matured outcomes';
+      log(`candle evidence ${row.name}: ${c.state} ${c.hours}h | dips ${c.total}, ${outcomes}, ${c.timedOut} timed out, ${c.pending} pending | median depth ${c.medianDepthPct ?? 'n/a'}% recovery ${c.medianRecoveryMinutes ?? 'n/a'}m | drawdown ${c.currentDrawdownPct}% total-volume ${c.recentVolumeRatio ?? 'n/a'}x | completed through ${c.latestCompletedTs}`);
+    }
+  }).catch(error => { try { log(`candle diagnostic log err: ${error?.message || error}`); } catch (e) {} });
   return best ? `scanned ${seen} -> ${best.sig.label} ${best.p.name}` : `scanned ${seen}, no signal`;
 }
 

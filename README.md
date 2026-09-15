@@ -63,6 +63,48 @@ If σ falls back to the legacy estimator on 2+ *mature* tokens in one scan, cand
 | **OFI** | Are *organic* wallets (Jupiter filters out bots) net buying or net selling? Don't be someone's exit liquidity | Jupiter |
 | **path** | Where is price in its recent story? Labels each pool `FREEFALL / BASING / BLOWOFF / GRIND-UP / CHOP` | OHLCV |
 
+### Completed-candle pullback evidence
+
+The public Meteora Data API also supplies a descriptive 5-minute history for BID
+ASK candidates. The measured event is explicit: a 5% close-based drawdown and an
+80% recovery of the peak-to-trough move within six hours of the trigger. Output
+separates recovered, timed-out, and still-observing events and includes median
+maximum drop, median recovery time, current completed-close drawdown, and the
+last hour's **total pool volume** versus prior complete hours. That volume is not
+Jupiter organic flow.
+
+Full 24-hour history is preferred. A known young pool is measured only from its
+first full 5-minute bucket and labeled `LIMITED`; a gap after pool creation is
+`WAIT`. Pool creation age and token age are kept separate. Unknown creation with
+less than a verified full day stays `WATCH`; an unknown-age history can qualify
+when the returned coverage is a complete full day. Small-sample counts come
+before the descriptive recovery fraction, which is not a win probability.
+
+The candle result is an actionable BID ASK gate. In addition to the base snapshot
+checks above, a READY entry needs the latest completed 5-minute bucket, verified
+contiguous coverage, at least 0.5x the median of prior complete hourly total
+volume (with one baseline hour), two distinct completed 5% dip / 80% recovery
+events with one recovery within three hours, and three wall-clock-aligned fully
+closed 15-minute buckets. Each support low is the minimum of that bucket's
+three completed 5-minute closes; the three support lows must be nondecreasing,
+and no failed active cycle may remain. An active
+non-timed-out dip may remain eligible only while the latest close is above its
+running trough. Missing or stale evidence is `WATCH`/`WAIT` and cannot alert or
+deploy. The evidence contains no fee or PnL model. Inspect one pool without
+loading config, a wallet, or Jupiter credentials:
+
+```bash
+npm run candles -- <POOL_ADDRESS>
+npm run candles -- <POOL_ADDRESS> --json
+```
+
+`screen.cjs` refreshes at most two current BID ASK candidates for its read-only
+preview. When no fresh TRADE is available, the daemon refreshes at most two
+deduplicated, capacity-fitting histories before BID ASK selection, oldest or
+uncollected first; other base-ready candidates remain `WATCH` and rotate through
+the persistent cache on later scans. Completed history is reused and only the
+5-minute tail is requested.
+
 ## The automated profiles
 
 **🔥 IGNITION** — an event-driven scalp. Fees clear the bar (edge ≥ 1) *and* the fee accumulator is surged *and* volume is accelerating. Never fires into a FREEFALL (huge fees during a crash are bait). Width scales with σ; brackets are computed from the pool's own vol and fee rate.
@@ -73,11 +115,11 @@ The band's **bottom is placed *on* the consolidation floor** (the recent 5-minut
 
 **🛡 CARRY** — boring on purpose. Mature token (3+ days), mint & freeze authority burned, big TVL, calm price, organic buyers on the 6-hour window, decent persistent fees. Wide ±35% range, rides for days. The fee floor is tiered: thin yield is only acceptable when risk-adjusted quality is exceptional.
 
-**🪣 BID ASK** — a quote-only accumulation profile. It is surfaced independently, so the same pool may show both a TRADE class and BID ASK. READY requires a fresh, complete snapshot; a non-SOL token X quoted in wrapped SOL token Y; mint and freeze authority disabled; top-holder concentration ≤35%; positive organic buy volume; 24h fee rate ≥8%/day with the 1h rate at least half of that; and no unbought FREEFALL (`OFI ≥1.43`). These are uncalibrated strategy priors, not evidence of profitability.
+**🪣 BID ASK** — a quote-only accumulation profile. It is surfaced independently, so the same pool may show both a TRADE class and BID ASK. READY requires a fresh, complete snapshot; a non-SOL token X quoted in wrapped SOL token Y; mint and freeze authority disabled; top-holder concentration ≤35%; positive organic buy volume; 24h fee rate ≥8%/day with the 1h rate at least half of that; no unbought FREEFALL (`OFI ≥1.43`); and the completed-candle evidence gate described above. These are uncalibrated strategy priors, not evidence of profitability.
 
 The requested band runs from the active bin down 60–75%, with depth mapped from σ and drawdown. Total principal is split 60–80% **BidAsk** and the remainder **Spot**, both added as SOL/token-Y to the same position and the same fixed bin IDs. `SIZE_BID_ASK=1` is the total across both layers. Deep widths use DLMM's geometric bin spacing; if the full range needs more than `MAX_BINS`, the bot reports `CAPACITY WAIT` and does not substitute a shallower trade.
 
-Execution keeps the existing TRADE family first when both profiles qualify. BID ASK is eligible for deployment when no executable TRADE remains; among BID ASK candidates, the scanner keeps its fee-rate/input order rather than treating geometric bin rounding as a profitability score.
+Execution keeps the existing TRADE family first when both profiles qualify. BID ASK is eligible for deployment when no executable TRADE remains; among BID ASK candidates, exact token mints are deduplicated, capacity-fitting siblings are retained, and fee-rate/input order remains the tiebreak rather than treating geometric bin rounding as a profitability score.
 
 Existing SQUEEZE rows remain TRADE positions and retain their saved exits/time-stop. New volatility-compression observations are diagnostic only: passive Bid-Ask liquidity does not provide a generic long-vol payoff that wins on either breakout direction.
 
@@ -205,6 +247,7 @@ npm run screen                           # one-shot preview of the configured to
 npm test                                 # mock-only strategy/recovery regression tests
 node calibrate.cjs                       # per-class results from real trades
 node replay.cjs [--max 150]              # entry-gate calibration curves from shadow observations
+node candle-analysis.cjs <POOL> [--json] # public completed-candle pullback evidence; no wallet/config
 node binscore.cjs <POOL> <VOL%/day>      # bin-crowding map — see where other LPs AREN'T
                                          # (fees are paid per-bin pro-rata: a thin bin in the
                                          #  path of price pays you 10-50x a crowded one)
@@ -229,6 +272,7 @@ Scan lines, deploys, and exits all print a clickable `meteora.ag/dlmm/<pool>` li
 | `shadow.jsonl` | every candidate evaluation, signal or not — the counterfactual dataset |
 | `replay-cache.json` | cached replay outcomes (a past outcome never changes) |
 | `daemon_state.json` | σ/fee history, cooldowns, OOR counters |
+| `candle_evidence.json` | bounded public OHLCV cache and latest descriptive BID ASK evidence |
 | `events.log` | every deploy/exit/failure, with the actual error text |
 | `daemon.log` | heartbeat + every scan verdict with reasons |
 | `.pending-swap.json` | crash-recovery ledger for a swap whose position didn't land |

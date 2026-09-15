@@ -69,7 +69,8 @@ async function fetchVolDay(poolAddress, fetchJson) {
     dd, pos,
     low6h: lo6 < Infinity ? lo6 : null,
     low: lo < Infinity ? lo : null,
-    close: isFinite(close) ? close : null
+    close: isFinite(close) ? close : null,
+    recentCandles: rvC
   };
 }
 
