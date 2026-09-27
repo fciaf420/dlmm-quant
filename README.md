@@ -146,7 +146,9 @@ Existing SQUEEZE rows remain TRADE positions and retain their saved exits/time-s
 
 ### Cap-aware take-profits
 
-In the replay's simplified uniform two-sided payoff model, price-driven gain approaches a cap of **about W/4** once inventory has converted to SOL (a DLMM bin simulation gives 4.5% vs 5% at W=20% and 7.4% vs 8.75% at W=35%, so it is slightly optimistic for wide bands). The TRADE recipes use that approximation to avoid setting brackets far beyond their modeled band payoff. Actual reachability still depends on DLMM bin shape, fill path, fees, slippage, and costs; pump-outs are normally booked by the out-of-range rule.
+In the replay's simplified uniform two-sided payoff model, price-driven gain approaches a cap of **about W/4** once inventory has converted to SOL (a DLMM bin simulation gives 4.5% vs 5% at W=20% and 7.4% vs 8.75% at W=35%, so it is slightly optimistic for wide bands).
+
+**One-sided bands (IGNITION when OFI > 2) get their own brackets.** A SOL-only 0 → −W band has **zero** price-driven upside (above the band it is 100% SOL, unchanged), so its TP is the fee term alone, and at the band bottom it has lost ~0.5W, not ~0.75W (SOL-only ladder, equal SOL per log-spaced bin: 6.13 / 10.37 / 15.89% at W = 12 / 20 / 30, vs 9.06 / 15.19 / 22.94% two-sided). IGNITION one-sided: TP = clamp(fee×0.5, 4, 25), SL = clamp(0.5W + 2, 8, 20). Two-sided brackets are unchanged (`gates.cjs` `tradeBrackets`). Note that `.env` `TP_IGNITION` / `SL_IGNITION` still override both sides. The TRADE recipes use that approximation to avoid setting brackets far beyond their modeled band payoff. Actual reachability still depends on DLMM bin shape, fill path, fees, slippage, and costs; pump-outs are normally booked by the out-of-range rule.
 
 ## The lifecycle
 

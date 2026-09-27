@@ -217,6 +217,60 @@ function updateFeeDecay(previous, row, snapshot) {
   return { position: row.position, belowCount, dataTs: snapshot.ts };
 }
 
+// RECIPE GEOMETRY - the ONE copy of which band each TRADE class would ship (width,
+// side, bins) and its edge on that band. Used by collectSignals (live deploys) and by
+// launchwatch.cjs's observational "would fire" (caught 2026-09-27: launchwatch priced
+// every class at a default +-20 band, so its WOULD column disagreed with the daemon).
+// Ranges/edges come back null/0 when the bin geometry is unknown.
+function recipePlan(d, c) {
+  d = d || {}; c = c || {};
+  const rawW = basingFloor({ px: d.px, low: d.low, low6h: d.low6h }).rawW;
+  const makeRange = (wanted, mode) => tradeRange({ widthPct: wanted, binStepBps: d.binStepBps, maxBins: c.maxBins, mode });
+  const ignitionWanted = Math.min(30, Math.max(12, Math.round(d.sigma / 4)));
+  // ONE-SIDED IL (2026-09-27, mirror of meteora-quant-lens): when ofi > 2 IGNITION ships a
+  // quote-only 0 -> -W band - same capital in half the width of +-W, 2x in-range IL.
+  const ignitionMode = d.ofi > 2 ? 'single' : 'two';
+  const ignitionRange = makeRange(ignitionWanted, ignitionMode);
+  const basingWanted = Math.min(30, Math.max(8, Math.round(rawW)));
+  const basingRange = makeRange(basingWanted, 'two');
+  const carryRange = makeRange(35, 'two');
+  const edge = (range, mode) => edgeForTradeRange(d.feeRate1h, d.sigma, range, mode);
+  return {
+    rawW,
+    IGNITION: { wanted: ignitionWanted, mode: ignitionMode, range: ignitionRange, edge: edge(ignitionRange, ignitionMode) },
+    BASING: { wanted: basingWanted, mode: 'two', range: basingRange, edge: edge(basingRange, 'two') },
+    CARRY: { wanted: 35, mode: 'two', range: carryRange, edge: edge(carryRange, 'two') },
+  };
+}
+
+// SIDE-AWARE EXIT BRACKETS (mirror of meteora-quant-lens). The CLI's own clamps and fee
+// multipliers are unchanged; only the price-driven terms depend on the band side
+// (rates.cjs): TP's ~W/4 upside cap is 0 for a one-sided SOL band (100% SOL above it,
+// fees are the only upside), and the SL's band-break term is ~0.5W instead of ~0.75W.
+// Two-sided brackets are numerically identical to before.
+function tradeBrackets(label, W, fr, mode = 'two') {
+  const up = RATES.priceUpsideCapPct(W, mode), loss = RATES.bandBreakLossPct(W, mode);
+  if (label === 'IGNITION') return { tp: Math.min(25, Math.max(4, Math.round(up + fr * 0.5))), sl: -Math.min(20, Math.max(8, Math.round(loss + 2))) };
+  if (label === 'BASING') return { tp: Math.min(20, Math.max(6, Math.round(up + fr))), sl: -Math.min(25, Math.max(10, Math.round(loss + 5))) };
+  if (label === 'CARRY') return { tp: Math.min(15, Math.max(6, Math.round(up + fr * 2))), sl: -Math.min(12, Math.max(8, Math.round(loss + 2))) };
+  return null;
+}
+
+// Observational only (launchwatch.cjs): which class WOULD the live gates fire on, priced
+// at the width and side the daemon would actually deploy. Deliberately ignores the
+// launch hold and data freshness - launchwatch exists to watch that regime.
+function wouldFire(d, c) {
+  d = d || {}; c = c || {};
+  const plan = recipePlan(d, c);
+  const edges = { IGNITION: plan.IGNITION.edge, BASING: plan.BASING.edge, CARRY: plan.CARRY.edge };
+  const would = plan.IGNITION.range && ignition({ edge: edges.IGNITION, sg: d.surge, ac: d.accel, org: d.org, path: d.path, ageH: d.ageH, ofi: d.ofi }) ? 'IGNITION'
+    : plan.BASING.range && finite(c.basingMaxFloor) && plan.rawW <= c.basingMaxFloor
+      && basing({ path: d.path, ofi: d.ofi, org: d.org, fr: d.feeRate1h, edge: edges.BASING }) ? 'BASING'
+      : plan.CARRY.range && carry({ edge: edges.CARRY, ofi6: d.ofi6, org: d.org, tvl: d.tvl, fr: d.feeRate1h, sigma: d.sigma, ageH: d.ageH, audit: d.audit || {}, path: d.path }) ? 'CARRY'
+        : null;
+  return { would, edges, ignitionMode: plan.IGNITION.mode, plan };
+}
+
 function collectSignals({ data: d, config: c, now = Date.now() }) {
   d = d || {}; c = c || {};
   const out = { trade: null, bidAsk: null, bidAskStatus: null, recipeEdges: {},
@@ -229,23 +283,13 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
     && !out.launchHold;
   if (d.supportedSolPair !== true || !finite(d.binStepBps) || d.binStepBps <= 0
       || !finite(d.sigma) || d.sigma <= 0 || !finite(d.feeRate1h)) return out;
-  const rawW = basingFloor({ px: d.px, low: d.low, low6h: d.low6h }).rawW;
-  const makeRange = (wanted, mode) => tradeRange({ widthPct: wanted, binStepBps: d.binStepBps, maxBins: c.maxBins, mode });
-  const ignitionWanted = Math.min(30, Math.max(12, Math.round(d.sigma / 4)));
-  const ignitionMode = d.ofi > 2 ? 'single' : 'two';
-  const ignitionRange = makeRange(ignitionWanted, ignitionMode);
-  // ONE-SIDED IL (2026-09-27, mirror of meteora-quant-lens): when ofi > 2 IGNITION ships a
-  // quote-only 0 -> -W band - same capital in half the width of +-W, 2x in-range IL.
-  const ignitionEdge = edgeForTradeRange(d.feeRate1h, d.sigma, ignitionRange, ignitionMode);
+  const plan = recipePlan(d, c);
+  const rawW = plan.rawW;
+  const { wanted: ignitionWanted, mode: ignitionMode, range: ignitionRange, edge: ignitionEdge } = plan.IGNITION;
+  const { range: basingRange, edge: basingEdge } = plan.BASING;
+  const { range: carryRange, edge: carryEdge } = plan.CARRY;
   out.recipeEdges.IGNITION = ignitionEdge;
-
-  const basingWanted = Math.min(30, Math.max(8, Math.round(rawW)));
-  const basingRange = makeRange(basingWanted, 'two');
-  const basingEdge = edgeForTradeRange(d.feeRate1h, d.sigma, basingRange, 'two');
   out.recipeEdges.BASING = basingEdge;
-
-  const carryRange = makeRange(35, 'two');
-  const carryEdge = edgeForTradeRange(d.feeRate1h, d.sigma, carryRange, 'two');
   out.recipeEdges.CARRY = carryEdge;
 
   const common = (label, mode, range, size, tp, sl, stop, wantedPct) => ({
@@ -255,24 +299,22 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
     edgeBasis: RATES.EDGE_BASIS,
   });
   if (dataFresh && ignitionRange && ignition({ edge: ignitionEdge, sg: d.surge, ac: d.accel, org: d.org, path: d.path, ageH: d.ageH, ofi: d.ofi })) {
+    // W = the band's depth; for a one-sided (ofi > 2) band that is its full width
     const W = ignitionRange.effectiveWidthPct;
+    const br = tradeBrackets('IGNITION', W, d.feeRate1h, ignitionMode);
     out.trade = common('IGNITION', ignitionMode, ignitionRange,
-      ignitionEdge >= 2 ? c.sizeIgnitionHi : c.sizeIgnition,
-      Math.min(25, Math.max(4, Math.round(W / 4 + d.feeRate1h * 0.5))),
-      -Math.min(20, Math.max(8, Math.round(0.75 * W + 2))), 0, ignitionWanted);
+      ignitionEdge >= 2 ? c.sizeIgnitionHi : c.sizeIgnition, br.tp, br.sl, 0, ignitionWanted);
   } else if (dataFresh && basingRange && rawW <= c.basingMaxFloor
       && basing({ path: d.path, ofi: d.ofi, org: d.org, fr: d.feeRate1h, edge: basingEdge })) {
     const W = basingRange.effectiveWidthPct;
     const stop = d.px > 0 ? d.px * (1 - W / 100) * 0.98 : 0;
-    out.trade = common('BASING', 'two', basingRange, c.sizeBasing,
-      Math.min(20, Math.max(6, Math.round(W / 4 + d.feeRate1h))),
-      -Math.min(25, Math.max(10, Math.round(0.75 * W + 5))), stop, Math.round(rawW));
+    const br = tradeBrackets('BASING', W, d.feeRate1h, 'two');
+    out.trade = common('BASING', 'two', basingRange, c.sizeBasing, br.tp, br.sl, stop, Math.round(rawW));
   } else if (dataFresh && carryRange && carry({ edge: carryEdge, ofi6: d.ofi6, org: d.org, tvl: d.tvl,
     fr: d.feeRate1h, sigma: d.sigma, ageH: d.ageH, audit: d.audit || {}, path: d.path })) {
     const W = carryRange.effectiveWidthPct;
-    out.trade = common('CARRY', 'two', carryRange, c.sizeCarry,
-      Math.min(15, Math.max(6, Math.round(W / 4 + d.feeRate1h * 2))),
-      -Math.min(12, Math.max(8, Math.round(0.75 * W + 2))), 0, 35);
+    const br = tradeBrackets('CARRY', W, d.feeRate1h, 'two');
+    out.trade = common('CARRY', 'two', carryRange, c.sizeCarry, br.tp, br.sl, 0, 35);
   }
 
   const audit = d.audit || {};
@@ -391,6 +433,7 @@ function selectExecutionSignal(entries) {
 
 module.exports = {
   classifyPath, edgeFrom, edgeForRange, edgeForTradeRange, ignition, basing, basingFloor, carry,
+  recipePlan, tradeBrackets, wouldFire,
   downsideRange, tradeRange, bidAskSignal, resolvePositionProfile,
   needsDeploymentResume, evaluateAccumLifecycle, signalsReady, updateFeeDecay, collectSignals,
   selectBidAskCandidates, selectBidAskHistoryCandidates, selectExecutionSignal,

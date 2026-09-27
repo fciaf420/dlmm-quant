@@ -115,6 +115,16 @@ const ilPerDay = (sigma, halfWidthPct) => ilPerDayForRange(sigma, 2 * halfWidthP
 // a one-sided band of depth D is equivalent to +-(D/2)
 const equivalentHalfWidth = (widthPct, mode = 'two') => (mode === 'single' ? widthPct / 2 : widthPct);
 const breakevenFeePerDayForRange = (sigma, fullWidthPct) => ilPerDayForRange(sigma, fullWidthPct) / LP_FEE_SHARE;
+
+// PRICE-DRIVEN BRACKET TERMS BY BAND SIDE (mirror of meteora-quant-lens). Verified with a
+// SOL-only ladder, equal SOL per log-spaced bin, marked at the band bottom:
+//   one-sided 0 -> -W loses 6.13 / 10.37 / 15.89% at W = 12 / 20 / 30  (~0.5W)
+//   two-sided +-W     loses 9.06 / 15.19 / 22.94%                       (~0.75W, the
+//   source of the existing 0.75W + k SLs)
+// and a one-sided SOL band has ZERO price-driven upside: above the band it is 100% SOL,
+// unchanged, so the ~W/4 cap term does not exist for it - its TP is fees only.
+const priceUpsideCapPct = (W, mode = 'two') => (mode === 'single' ? 0 : W / 4);
+const bandBreakLossPct = (W, mode = 'two') => (mode === 'single' ? 0.5 : 0.75) * W;
 const breakevenFeePerDay = (sigma, halfWidthPct) => breakevenFeePerDayForRange(sigma, 2 * halfWidthPct);
 
 // ---- legacy shadow-row conversion (ONE copy, shared by replay.cjs + launchlab.cjs) --
@@ -186,6 +196,6 @@ module.exports = {
   EDGE_SAFETY, LEGACY_EDGE_TO_V1, REPLAY_CACHE_VERSION,
   poolAgeHours, coveredHours, windowPerDay, accelFrom, poolAgeStage, launchHeld,
   legacyWindowRate, ilPerDay, ilPerDayForRange, equivalentHalfWidth,
-  breakevenFeePerDay, breakevenFeePerDayForRange,
+  breakevenFeePerDay, breakevenFeePerDayForRange, priceUpsideCapPct, bandBreakLossPct,
   rowPoolAgeH, legacyEdgeOneSided, legacyRowToV1, replayCacheHit, legacyBasisSummary, legacyBasisLine,
 };

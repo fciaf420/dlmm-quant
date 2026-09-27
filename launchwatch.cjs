@@ -72,7 +72,6 @@ async function tick() {
       let dd=null,pos=null,low=null,low6h=null,rv=null;
       try { const vd = await fetchVolDay(p.address, (u)=>jget(u)); rv=vd.rv; dd=vd.dd; pos=vd.pos; low=vd.low; low6h=vd.low6h; } catch(e){}
       const sigma = sigmaFrom(rv, ageH, pc5, pc1, pc24);
-      const edge = GATES.edgeFrom(p._fr, sigma);
       const ofi = (t.stats1h?.sellOrganicVolume||0)/Math.max(t.stats1h?.buyOrganicVolume||0,1);
       const ofi6 = (t.stats6h?.sellOrganicVolume||0)/Math.max(t.stats6h?.buyOrganicVolume||0,1);
       const org = t.organicScore||0;
@@ -85,10 +84,15 @@ async function tick() {
       const hs = h.filter(x=>x.src===src).map(x=>x.sigma);
       let sqzR = null;
       if (hs.length >= 4) { const prior=hs.slice(0,-1).sort((a,b)=>a-b); const med=prior[Math.floor(prior.length/2)]; sqzR = +(sigma/Math.max(med,.001)).toFixed(2); }
-      // WOULD the live gates fire? (recorded, never acted on)
-      const would = GATES.ignition({edge,sg:p._sg,ac:p._ac,org,path,ageH,ofi}) ? 'IGNITION'
-                  : GATES.basing({path,ofi,org,fr:p._fr,edge}) ? 'BASING'
-                  : GATES.carry({edge,ofi6,org,tvl:p.tvl,fr:p._fr,sigma,ageH,audit:t.audit||{},path}) ? 'CARRY' : null;
+      // WOULD the live gates fire? (recorded, never acted on). Priced at the width and SIDE
+      // the daemon would actually deploy (gates.cjs recipePlan: IGNITION one-sided when
+      // ofi > 2, bin-step geometry, BASING tight-base gate) - it used to price every class
+      // at a default +-20 band, so WOULD disagreed with the daemon (fixed 2026-09-27).
+      const wf = GATES.wouldFire({ feeRate1h: p._fr, sigma, ofi, ofi6, org, surge: p._sg, accel: p._ac,
+        path, ageH, tvl: p.tvl, audit: t.audit || {}, px, low, low6h, binStepBps: Number(p.pool_config?.bin_step) },
+        { maxBins: CFG.MAX_BINS, basingMaxFloor: CFG.BASING_MAX_FLOOR });
+      const edge = wf.edges.IGNITION;
+      const would = wf.would;
       fs.appendFileSync(SHADOW, JSON.stringify({ t: now, pool: p.address, name: p.name, poolAgeH:+((now-(p.created_at||now))/3600e3).toFixed(2),
         tvl: Math.round(p.tvl||0), vol30m: Math.round(p.volume?.["30m"]||0), fr:+p._fr.toFixed(2), sg:+p._sg.toFixed(2), ac:+p._ac.toFixed(2),
         sigma:+sigma.toFixed(1), src, edge:+edge.toFixed(3), ofi:+ofi.toFixed(2), ofi6:+ofi6.toFixed(2), org:Math.round(org),
@@ -97,7 +101,8 @@ async function tick() {
         mint: p.token_x.address, would,
         // the daemon would HOLD a sub-1h pool regardless of `would` (gates.cjs launch hold);
         // basis tags keep these rows separable from pre-fix observations in replay/launchlab
-        launchHold: RATES.launchHeld(p._poolAgeH), eb: RATES.EDGE_BASIS, fb: RATES.FEE_BASIS }) + '\n');
+        launchHold: RATES.launchHeld(p._poolAgeH), eb: RATES.EDGE_BASIS, fb: RATES.FEE_BASIS,
+        recipeEdges: wf.edges, ignMode: wf.ignitionMode }) + '\n');
       log(`  ${(p.name||'?').padEnd(16).slice(0,16)} pool ${((now-(p.created_at||now))/60e3).toFixed(0).padStart(3)}m fr ${p._fr.toFixed(0).padStart(4)} sigma ${sigma.toFixed(0).padStart(4)} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${would?'=> WOULD '+would:''}`);
       await sleep(LW.THROTTLE);
     } catch(e) { log(`  err ${p.name}: ${e.message}`); }

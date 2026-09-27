@@ -250,3 +250,82 @@ test('pool-age backfill fetches each pool once, caches to disk, and never throws
   assert.equal(needsPoolAge({ ...row, fb: RATES.FEE_BASIS }, RATES.FEE_BASIS), false);
   assert.equal(RATES.legacyRowToV1(row, r2.createdAt(row.pool)).fr, 80);
 });
+
+// ---- follow-ups 2: side-aware exit brackets, launchwatch "would fire" geometry ----
+
+// SOL-only ladder, equal SOL per log-spaced bin, marked at the band bottom (1 - W)
+function bandBottomLossPct(W, mode, n = 400) {
+  const lo = Math.log(1 - W / 100);
+  let v = 0;
+  const solShare = mode === 'single' ? 1 : 0.5;
+  for (let i = 0; i < n; i++) v += (solShare / n) / Math.exp(lo * (i + 0.5) / n) * (1 - W / 100);
+  // two-sided: the token half is all token at any price below entry -> worth (1 - W) at the bottom
+  if (mode !== 'single') v += 0.5 * (1 - W / 100);
+  return (1 - v) * 100;
+}
+
+test('band-break loss is ~0.5W one-sided vs ~0.75W two-sided (the numbers behind the SL terms)', () => {
+  const one = [12, 20, 30].map((W) => +bandBottomLossPct(W, 'single').toFixed(2));
+  const two = [12, 20, 30].map((W) => +bandBottomLossPct(W, 'two').toFixed(2));
+  assert.deepEqual(one, [6.13, 10.37, 15.89]);
+  assert.deepEqual(two, [9.06, 15.19, 22.94]);
+  // the bracket terms track those losses; a one-sided SOL band has no price upside
+  assert.equal(RATES.bandBreakLossPct(20, 'single'), 10);
+  assert.equal(RATES.bandBreakLossPct(20, 'two'), 15);
+  assert.equal(RATES.priceUpsideCapPct(20, 'single'), 0);
+  assert.equal(RATES.priceUpsideCapPct(20, 'two'), 5);
+});
+
+test('one-sided brackets: TP is fees only, SL uses 0.5W; two-sided brackets are unchanged', () => {
+  const fr = 10;
+  const rows = [12, 20, 30].map((W) => ({ W, one: GATES.tradeBrackets('IGNITION', W, fr, 'single'), two: GATES.tradeBrackets('IGNITION', W, fr, 'two') }));
+  // single: tp = clamp(round(fr*0.5), 4, 25) = 5 ; sl = -clamp(round(0.5W+2), 8, 20)
+  assert.deepEqual(rows.map((r) => r.one), [{ tp: 5, sl: -8 }, { tp: 5, sl: -12 }, { tp: 5, sl: -17 }]);
+  // two: tp = clamp(round(W/4 + fr*0.5), 4, 25) ; sl = -clamp(round(0.75W+2), 8, 20) - pre-fix numbers
+  assert.deepEqual(rows.map((r) => r.two), [{ tp: 8, sl: -11 }, { tp: 10, sl: -17 }, { tp: 13, sl: -20 }]);
+  // each one-sided SL sits beyond that band's own break loss (6.13/10.37/15.89)
+  rows.forEach((r, i) => assert.ok(-r.one.sl > [6.13, 10.37, 15.89][i]));
+  // TP floor still applies with no price term: tiny fees -> 4
+  assert.equal(GATES.tradeBrackets('IGNITION', 20, 1, 'single').tp, 4);
+  // BASING/CARRY keep their own CLI constants (two-sided in every recipe)
+  assert.deepEqual(GATES.tradeBrackets('BASING', 20, 10, 'two'), { tp: 15, sl: -20 });
+  assert.deepEqual(GATES.tradeBrackets('CARRY', 29.4, 3, 'two'), { tp: 13, sl: -12 });
+});
+
+test('a one-sided IGNITION deploy carries fees-only TP and the 0.5W SL', () => {
+  // ofi 2.5 -> single band; fr 72 = 2x the two-sided test fee so the halved edge still clears 1.0
+  const data = { ...common, feeRate1h: 72, feeRate24h: 40, ofi: 2.5, ageH: 100, poolAgeH: 5 };
+  const s = GATES.collectSignals({ now: 2_000_000, data, config: cfg });
+  assert.equal(s.trade && s.trade.label, 'IGNITION');
+  assert.equal(s.trade.mode, 'single');
+  const W = s.trade.widthPct;
+  assert.equal(s.trade.tp, Math.min(25, Math.max(4, Math.round(72 * 0.5))));          // 25: fees only (capped)
+  assert.equal(s.trade.sl, -Math.min(20, Math.max(8, Math.round(0.5 * W + 2))));
+  const two = GATES.collectSignals({ now: 2_000_000, data: { ...data, ofi: 1 }, config: cfg });
+  assert.equal(two.trade.mode, 'two');
+  assert.equal(two.trade.sl, -Math.min(20, Math.max(8, Math.round(0.75 * two.trade.widthPct + 2))));
+});
+
+test('launchwatch WOULD prices each class at the recipe width and side the daemon deploys', () => {
+  const d = { feeRate1h: 36, sigma: 30, ofi: 2.5, ofi6: 0.8, org: 80, surge: 1.4, accel: 1.3, path: 'CHOP', ageH: 100,
+    tvl: 200_000, audit: { mintAuthorityDisabled: true, freezeAuthorityDisabled: true }, px: 100, low: 80, low6h: 90, binStepBps: 100 };
+  const c = { maxBins: 140, basingMaxFloor: 25 };
+  const wf = GATES.wouldFire(d, c);
+  const plan = GATES.recipePlan(d, c);
+  // same geometry and edges collectSignals uses (one copy)
+  const live = GATES.collectSignals({ now: 2_000_000, data: { ...common, ...d, feeRate24h: 12, poolAgeH: 5 }, config: { ...cfg, ...c } });
+  assert.ok(close(wf.edges.IGNITION, live.recipeEdges.IGNITION, 1e-12));
+  assert.ok(close(wf.edges.CARRY, live.recipeEdges.CARRY, 1e-12));
+  assert.equal(wf.ignitionMode, 'single');
+  // one-sided recipe depth, halved - NOT the old default +-20 band
+  assert.ok(close(wf.edges.IGNITION, GATES.edgeFrom(36, 30, plan.IGNITION.range.effectiveWidthPct / 2), 1e-12));
+  assert.ok(Math.abs(wf.edges.IGNITION - GATES.edgeFrom(36, 30, 20)) > 0.5);
+  // WOULD agrees with what the daemon would deploy on the same inputs
+  assert.equal(wf.would, live.trade && live.trade.label);
+  // observational: a sub-1h pool the daemon would HOLD is still classified
+  const held = GATES.collectSignals({ now: 2_000_000, data: { ...common, ...d, feeRate24h: 12, poolAgeH: 0.4 }, config: { ...cfg, ...c } });
+  assert.equal(held.trade, null);
+  assert.equal(GATES.wouldFire(d, c).would, wf.would);
+  // unknown bin geometry -> no edge, no WOULD (the daemon skips such pools too)
+  assert.equal(GATES.wouldFire({ ...d, binStepBps: undefined }, c).would, null);
+});
