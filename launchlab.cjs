@@ -1,7 +1,7 @@
 // launchlab.cjs — does ANY LP configuration have positive expectancy on launch-phase
 // tokens? Offline, read-only, propose-only. Never trades, never edits config.
 //
-//   node launchlab.cjs [--maxAge 8] [--max 120] [--horizon 3]
+//   node launchlab.cjs [--maxAge 8] [--max 120] [--horizon 3] [--no-backfill]
 //
 // The question this settles: the daemon DOES see launches (14 of 39 tokens first seen
 // within 8h) and rejects ~96%% of them on edge, because edge = fr/sigma^2 and launch
@@ -16,14 +16,25 @@
 // the ORDERING of variants far more than the absolute numbers, and note there is no
 // slippage or swap cost here, which flatters every variant equally.
 const fs = require('fs');
+const RATES = require('./rates.cjs');
+const { createPoolCreatedResolver, needsPoolAge } = require('./pool_created.cjs');
 const DIR = __dirname;
+// LEGACY BASIS (2026-09-27): same conversion as replay.cjs via rates.cjs legacyRowToV1 -
+// edge x5/9 (+x0.5 for an identifiable one-sided band), and the pool-age fr fix, with the
+// pool age logged or backfilled from created_at (pool_created.cjs). Cache entries carry
+// v = RATES.REPLAY_CACHE_VERSION; older-basis simulations (fr understated on sub-1h
+// pools, which is most launch rows) are re-run. These rows are launch-phase, so the fee
+// fix matters here far more than in replay.
 const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? +process.argv[i + 1] : d; };
 const MAX_AGE = arg('maxAge', 8), MAX_NEW = arg('max', 120), HORIZON_H = arg('horizon', 3);
 const CACHE = DIR + '/launchlab-cache.json';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// launchlab entries keep the variant map in `v`, so the basis version lives in `basis`
+const launchCacheHit = (entry) => !!entry && entry.basis === RATES.REPLAY_CACHE_VERSION;
 
 // ---- payoff models -------------------------------------------------------
-// TWO-SIDED, uniform: upside caps at W/4 (token half converts out as price climbs),
+// TWO-SIDED, uniform: upside caps at ~W/4 (token half converts out as price climbs;
+// a DLMM bin sim gives 4.5% vs 5% at W=20%, 7.4% vs 8.75% at W=35%),
 // downside ~0.75x to band break then 1:1 below. Verbatim from replay.cjs.
 function pnlTwoSided(r, W) {
   const d = r - 1;
@@ -74,12 +85,14 @@ async function fetchPath(row) {
   return { candles, fees };
 }
 
-function runVariant(row, path, V) {
+function runVariant(row, path, V, conv) {
+  conv = conv || RATES.legacyRowToV1(row);
+  const fr = conv.fr;
   const { candles, fees } = path;
   const p0 = Number(candles[0].open) || Number(candles[0].close);
   if (!(p0 > 0) || !(row.tvl > 0)) return null;
   const W = (V.width != null ? V.width : Math.min(30, Math.max(12, Math.round(row.sigma / 4)))) / 100;
-  const tpPct = Math.min(25, Math.max(4, Math.round(W * 100 / 4 + row.fr * 0.5)));
+  const tpPct = Math.min(25, Math.max(4, Math.round(W * 100 / 4 + fr * 0.5)));
   const slPct = Math.min(20, Math.max(8, Math.round(0.75 * W * 100 + 2)));
   const bins = V.side === 'bid' ? makeBidLadder(W) : null;
   let feePnl = 0, oorRun = 0, decayRun = 0, trigger = 'HORIZON', pnl = 0, filled = false;
@@ -92,7 +105,7 @@ function runVariant(row, path, V) {
     if (V.side === 'bid') { stepBidLadder(bins, r); if (r <= 1) filled = true; pnl = (bidValue(bins, r) - 1) * 100 + feePnl; }
     else pnl = pnlTwoSided(r, W) * 100 + feePnl;
     const bucketFr = (fees[c.timestamp] || 0) / row.tvl * 288 * 100;   // 5m -> %/day
-    decayRun = (row.fr > 2 && bucketFr < 0.5 * row.fr) ? decayRun + 1 : 0;
+    decayRun = (fr > 2 && bucketFr < 0.5 * fr) ? decayRun + 1 : 0;
     oorRun = !inRange ? oorRun + 1 : 0;
     if (V.stopMin != null && mins >= V.stopMin) { trigger = 'TIME'; break; }
     if (pnl >= tpPct) { trigger = 'TP'; break; }
@@ -103,7 +116,8 @@ function runVariant(row, path, V) {
   return { pnl: +pnl.toFixed(2), trigger, fees: +feePnl.toFixed(2), filled };
 }
 
-(async () => {
+async function main() {
+  const backfill = !process.argv.includes('--no-backfill');
   const rows = fs.readFileSync(DIR + '/shadow.jsonl', 'utf8').split('\n').filter(Boolean)
     .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
     .filter(r => r.ageH != null && r.ageH < MAX_AGE && r.tvl > 0);
@@ -113,22 +127,30 @@ function runVariant(row, path, V) {
   const ripe = obs.filter(r => Date.now() - r.t > (HORIZON_H * 3600 + 900) * 1000);
   console.log(`launch-phase rows (age<${MAX_AGE}h): ${rows.length} -> ${obs.length} deduped -> ${ripe.length} with a full ${HORIZON_H}h forward window\n`);
 
+  const resolver = createPoolCreatedResolver({ cacheFile: DIR + '/pool-created.json', enabled: backfill });
+  await resolver.resolve(ripe.filter((r) => needsPoolAge(r, RATES.FEE_BASIS)).map((r) => r.pool));
+  const convOf = (row) => RATES.legacyRowToV1(row, resolver.createdAt(row.pool));
+  if (resolver.stats.fetched || resolver.stats.failed || resolver.stats.skipped) {
+    console.log(`pool-age backfill: ${resolver.stats.fetched} fetched, ${resolver.stats.cached} cached, ${resolver.stats.failed} failed${resolver.stats.skipped ? `, ${resolver.stats.skipped} skipped (--no-backfill)` : ''}`);
+  }
   const cache = fs.existsSync(CACHE) ? JSON.parse(fs.readFileSync(CACHE, 'utf8')) : {};
   let fetched = 0;
   for (const row of ripe) {
     const key = row.t + ':' + row.pool;
-    if (cache[key] || fetched >= MAX_NEW) continue;
+    if (launchCacheHit(cache[key]) || fetched >= MAX_NEW) continue;
     const path = await fetchPath(row);
     fetched++;
-    if (!path) { cache[key] = { skip: 'no-candles' }; continue; }
-    const res = { edge: row.edge, sigma: row.sigma, fr: row.fr, ageH: row.ageH, name: row.name, v: {} };
-    for (const V of VARIANTS) { const out = runVariant(row, path, V); if (out) res.v[V.key] = out; }
+    if (!path) { cache[key] = { skip: 'no-candles', basis: RATES.REPLAY_CACHE_VERSION }; continue; }
+    const conv = convOf(row);
+    const res = { edge: conv.edge, sigma: row.sigma, fr: conv.fr, ageH: row.ageH, name: row.name, v: {}, basis: RATES.REPLAY_CACHE_VERSION };
+    for (const V of VARIANTS) { const out = runVariant(row, path, V, conv); if (out) res.v[V.key] = out; }
     cache[key] = res;
     await sleep(150);
     if (fetched % 20 === 0) process.stdout.write(`\r  fetched ${fetched} paths…`);
   }
   fs.writeFileSync(CACHE, JSON.stringify(cache));
-  const done = ripe.map(r => cache[r.t + ':' + r.pool]).filter(x => x && !x.skip && x.v);
+  const done = ripe.map(r => cache[r.t + ':' + r.pool]).filter(x => launchCacheHit(x) && !x.skip && x.v);
+  console.log(RATES.legacyBasisLine(RATES.legacyBasisSummary(ripe.map(convOf))));
   console.log(`\nsimulated: ${Object.keys(cache).length} (${fetched} new this run) | usable: ${done.length}\n`);
   if (!done.length) { console.log('no usable observations yet — rerun later as the forward windows mature'); return; }
 
@@ -149,4 +171,7 @@ function runVariant(row, path, V) {
   console.log(`\none-sided bid fill rate: ${fillRate}/${done.length} (unfilled = launch never retraced into the band = 0 PnL, 0 fees)`);
   console.log('friction: a real round trip costs ~0.4%% (measured). Nothing below that is tradeable.');
   console.log('NOTE: no slippage/swap cost modeled — every variant is flattered equally, so compare RANKS not levels.');
-})();
+}
+
+module.exports = { runVariant, launchCacheHit };
+if (require.main === module) main().catch((e) => { console.error('ERR', e.message); process.exit(1); });

@@ -5,6 +5,7 @@ const DIR = __dirname;
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
 const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
 const GATES = require("./gates.cjs");   // shared with screen.cjs — edit gates THERE, not inline
+const RATES = require('./rates.cjs');   // pool-age-aware window rates (shared with screen/deploy)
 const { createCandleDiagnostics } = require('./candle_diagnostics.cjs');
 const { refreshBidAskCandidates } = require('./bidask_runtime.cjs');
 const SOLM = CFG.QUOTE_MINT;
@@ -172,7 +173,15 @@ async function manage(){
       const pool = await jget(`${MET}/pools/${p.pool}`);
       const numberOrNull = (v) => (v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))) ? Number(v) : null;
       const feeRatio1h = numberOrNull(pool.fee_tvl_ratio?.["1h"]);
-      const feeRate = feeRatio1h == null ? null : feeRatio1h * 24;
+      // pool-age-aware (rates.cjs): a sub-1h pool's "1h" window holds only its lifetime
+      const feeRate = RATES.windowPerDay(feeRatio1h, 1, RATES.poolAgeHours(pool.created_at));
+      // Registry baselines stamped before feeBasis 'pool-age-v1' stored a young pool's
+      // since-creation fee/TVL as if it were a full window (NEARPAD: 6.4 stored for a real
+      // ~91%/day normal), which left FEE-DECAY's below-normal guard unreachable. Rescale
+      // by pool age at openedAt, read-time only - positions.json is never rewritten here.
+      const baseE1 = RATES.legacyWindowRate(p.entryFeeRate, 1, p.openedAt, pool.created_at, p.feeBasis);
+      const baseE24 = RATES.legacyWindowRate(p.entryFeeRate24h, 24, p.openedAt, pool.created_at, p.feeBasis);
+      const pBase = { ...p, entryFeeRate: baseE1 ?? p.entryFeeRate, entryFeeRate24h: baseE24 ?? p.entryFeeRate24h };
       const tk = await jget(`https://api.jup.ag/tokens/v2/search?query=${p.mint}`, true);
       const t = Array.isArray(tk) ? tk.find(x => (x.id || x.address || x.mint) === p.mint) : null;
       const buy1 = numberOrNull(t?.stats1h?.buyOrganicVolume);
@@ -187,13 +196,13 @@ async function manage(){
       // death (5/5 live exits were FEE-DECAY inside 40min, incl. CATE 'dying' at a
       // healthy 7.3%%/d). Decay now also requires the rate to be below the pool's
       // NORMAL level (24h rate at entry): below-entry AND below-normal = actually dying.
-      const normFee = (CFG.FEE_DECAY_VS_NORM && p.entryFeeRate24h > 0) ? p.entryFeeRate24h : 1e9;
+      const normFee = (CFG.FEE_DECAY_VS_NORM && pBase.entryFeeRate24h > 0) ? pBase.entryFeeRate24h : 1e9;
       let trigger = null;
       const accum = p.profile === 'ACCUM' || p.profile === 'ACCUM_INFERRED';
       s.positionSignals = s.positionSignals || {};
       const posSignalKey = p.position || p.pool;
       if (accum) {
-        const feeState = GATES.updateFeeDecay(s.positionSignals[posSignalKey], p, signalSnapshot);
+        const feeState = GATES.updateFeeDecay(s.positionSignals[posSignalKey], pBase, signalSnapshot);
         s.positionSignals[posSignalKey] = feeState;
         const decay = feeState.belowCount >= 2;
         const flow = signalsReady && ofi > CFG.FLOW_OFI && pc1 < CFG.FLOW_PC1;
@@ -223,9 +232,9 @@ async function manage(){
         trigger = `OOR-${oorDir} ${((s.oorTicks[p.pool]||0) >= CFG.OOR_TICKS)
           ? `x${s.oorTicks[p.pool]} ticks`
           : `DEEP ${pnlPct.toFixed(1)}% past ${Math.round(CFG.OOR_DEEP_FRAC*100)}% of SL ${p.slPct}% — persistence bypassed`} (no fee income OOR — ${oorDir === 'UP' ? 'booking gain, TP unreachable from outside range' : 'cutting dead exposure before it grinds to SL'})`;
-      else if (signalsReady && feeRate < CFG.FEE_DECAY_FRAC*p.entryFeeRate && feeRate < normFee
-        && (s.lastFeeRates[p.pool]??1e9) < CFG.FEE_DECAY_FRAC*p.entryFeeRate && (s.lastFeeRates[p.pool]??1e9) < normFee)
-        trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of entry ${p.entryFeeRate.toFixed(1)}${normFee<1e9?` AND < norm ${normFee.toFixed(1)}`:''}, x2)`;
+      else if (signalsReady && feeRate < CFG.FEE_DECAY_FRAC*pBase.entryFeeRate && feeRate < normFee
+        && (s.lastFeeRates[p.pool]??1e9) < CFG.FEE_DECAY_FRAC*pBase.entryFeeRate && (s.lastFeeRates[p.pool]??1e9) < normFee)
+        trigger = `FEE-DECAY (${feeRate.toFixed(1)} < ${Math.round(CFG.FEE_DECAY_FRAC*100)}% of entry ${pBase.entryFeeRate.toFixed(1)}${normFee<1e9?` AND < norm ${normFee.toFixed(1)}`:''}, x2)`;
       else if (signalsReady && ofi > CFG.FLOW_OFI && pc1 < CFG.FLOW_PC1) trigger = `FLOW-FLIP (OFI ${ofi.toFixed(1)}, 1h ${pc1.toFixed(1)}%)`;
       else if (p.label === 'SQUEEZE' && p.openedAt && (Date.now() - new Date(p.openedAt).getTime()) > CFG.SQZ_TIMEOUT_H*3600e3 && Math.abs(pnlPct) < 3) trigger = `TIME-STOP (squeeze unresolved ${CFG.SQZ_TIMEOUT_H}h, pnl ${pnlPct.toFixed(1)}%)`;
       if (signalsReady) s.lastFeeRates[p.pool] = feeRate;
@@ -266,16 +275,22 @@ async function scan(){
   const boardTs = Date.now();
   // token_y must be SOL: deploy.cjs swaps SOL->token_x and treats the Y side as lamports,
   // so SOL-first pools (SOL-HYPE) and USDC-quoted pools can't be deployed by this path.
+  // LAUNCH HOLD: sub-1h pools cannot deploy (gates.cjs), and with pool-age-aware rates
+  // they would sort to the top and eat SCAN_TOP_N slots - so they don't get a slot.
+  // launchwatch.cjs remains the observer for that regime.
   const B = (bd.data||bd).filter(p=>Number(p.tvl)>=CFG.MIN_TVL && Number(p.volume?.["24h"])>=CFG.MIN_VOL_24H
-    && p.token_x?.address && p.token_x.address!==SOLM && p.token_y?.address===SOLM);
+    && p.token_x?.address && p.token_x.address!==SOLM && p.token_y?.address===SOLM
+    && !RATES.launchHeld(RATES.poolAgeHours(p.created_at, boardTs)));
   const metric = (v) => (v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))) ? Number(v) : null;
   B.forEach(p=>{
     const f1=metric(p.fee_tvl_ratio?.["1h"]), base=metric(p.pool_config?.base_fee_pct);
     const v30=metric(p.volume?.["30m"]), v4=metric(p.volume?.["4h"]);
-    p._fr=f1==null?null:f1*24;
-    p._fr24=metric(p.fee_tvl_ratio?.["24h"]);
+    // pool-age-aware windows (rates.cjs): a young pool's "24h" is its lifetime, not a day
+    p._poolAgeH=RATES.poolAgeHours(p.created_at, boardTs);
+    p._fr=RATES.windowPerDay(f1, 1, p._poolAgeH);
+    p._fr24=RATES.windowPerDay(metric(p.fee_tvl_ratio?.["24h"]), 24, p._poolAgeH);
     p._sg=metric(p.dynamic_fee_pct)==null||base==null||base<=0?null:metric(p.dynamic_fee_pct)/base;
-    p._ac=v30==null||v4==null?null:(v30*48)/Math.max(v4*6,1);
+    p._ac=RATES.accelFrom(v30, v4, p._poolAgeH);
   });
   B.sort((a,b)=>(b._fr??-Infinity)-(a._fr??-Infinity));
   let best = null;
@@ -358,7 +373,7 @@ async function scan(){
       const dataTs = Math.min(boardTs, tokenHit.ts);
       const scanData = {
         address: p.address, ok: true, ts: dataTs, supportedSolPair: true,
-        feeRate1h: p._fr, feeRate24h: p._fr24, sigma, surge: p._sg, accel: p._ac,
+        feeRate1h: p._fr, feeRate24h: p._fr24, sigma, surge: p._sg, accel: p._ac, poolAgeH: p._poolAgeH,
         org, orgBuy1h: buy1, path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit,
         px, low, low6h, dd, binStepBps: Number(p.pool_config?.bin_step),
       };
@@ -403,6 +418,10 @@ async function scan(){
           sigma: +sigma.toFixed(1), src: rv != null ? 'rv' : 'lg',
           edge: +(evaluated.trade ? evaluated.trade.edge : edge).toFixed(3),
           edgeModel: 'pool-width heuristic', recipeEdges: evaluated.recipeEdges,
+          // basis tags: rows before these fields used fr*0.9/(1.3*s^2/8W) and full-window
+          // fee divisors. replay.cjs rescales legacy edges; never mix bases unconverted.
+          eb: RATES.EDGE_BASIS, fb: RATES.FEE_BASIS,
+          poolAgeH: p._poolAgeH == null ? null : +p._poolAgeH.toFixed(2),
           ofi: ofi == null ? null : +ofi.toFixed(2), ofi6: ofi6 == null ? null : +ofi6.toFixed(2), org: org == null ? null : Math.round(org), path, ageH: +ageH.toFixed(1),
           dd: dd != null ? Math.round(dd) : null, sig: evaluated.trade ? evaluated.trade.label : null, w: evaluated.trade ? evaluated.trade.widthPct : null,
           bidAsk: evaluated.bidAskStatus?.baseReady

@@ -68,5 +68,5 @@ const f2 = (v) => v == null ? '—' : v.toFixed(1);
   }
   console.log('Reading the trigger mix: TP× high = brackets working; FEE-DECAY× dominant = fees are the');
   console.log('real exit (TP likely too far); SL× high with quick recoveries = stops too tight; OOR-UP×');
-  console.log('high = pump-outs booking the cap — nominal TP above W/4+fees is decorative for that class.');
+  console.log('high = pump-outs booking the cap — nominal TP above ~W/4+fees is decorative for that class.');
 })();

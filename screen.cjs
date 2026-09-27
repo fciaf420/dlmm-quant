@@ -2,6 +2,7 @@
 const { JUP_KEY: JK, CFG } = require('./config.cjs');
 const { fetchVolDay, sigmaFrom } = require('./vol.cjs');
 const GATES = require('./gates.cjs');
+const RATES = require('./rates.cjs');
 const { createCandleDiagnostics } = require('./candle_diagnostics.cjs');
 const { refreshBidAskCandidates } = require('./bidask_runtime.cjs');
 const fs = require('fs');
@@ -14,18 +15,21 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
   if (!boardResponse.ok) throw new Error(`pool board ${boardResponse.status}`);
   const bd = await boardResponse.json();
   const boardTs = Date.now();
+  // mirror of trader_daemon scan(): pool-age-aware rates, sub-1h pools get no slot
   const B = (bd.data || bd).filter(p => Number(p.tvl) >= CFG.MIN_TVL
     && Number(p.volume?.['24h']) >= CFG.MIN_VOL_24H
     && p.token_x?.address && p.token_x.address !== CFG.QUOTE_MINT
-    && p.token_y?.address === CFG.QUOTE_MINT);
+    && p.token_y?.address === CFG.QUOTE_MINT
+    && !RATES.launchHeld(RATES.poolAgeHours(p.created_at, boardTs)));
   B.forEach(p => {
     const f1 = metric(p.fee_tvl_ratio?.['1h']);
     const base = metric(p.pool_config?.base_fee_pct);
     const v30 = metric(p.volume?.['30m']), v4 = metric(p.volume?.['4h']);
-    p._fr = f1 == null ? null : f1 * 24;
-    p._fr24 = metric(p.fee_tvl_ratio?.['24h']);
+    p._poolAgeH = RATES.poolAgeHours(p.created_at, boardTs);
+    p._fr = RATES.windowPerDay(f1, 1, p._poolAgeH);
+    p._fr24 = RATES.windowPerDay(metric(p.fee_tvl_ratio?.['24h']), 24, p._poolAgeH);
     p._sg = metric(p.dynamic_fee_pct) == null || base == null || base <= 0 ? null : metric(p.dynamic_fee_pct) / base;
-    p._ac = v30 == null || v4 == null ? null : (v30 * 48) / Math.max(v4 * 6, 1);
+    p._ac = RATES.accelFrom(v30, v4, p._poolAgeH);
   });
   B.sort((a, b) => (b._fr ?? -Infinity) - (a._fr ?? -Infinity));
 
@@ -66,7 +70,7 @@ const show = (v, digits = 2) => v == null ? '?' : Number(v).toFixed(digits);
       const dataTs = Math.min(boardTs, tokenHit.ts);
       const scanData = {
         address: p.address, ok: true, ts: dataTs, supportedSolPair: true,
-        feeRate1h: p._fr, feeRate24h: p._fr24, sigma,
+        feeRate1h: p._fr, feeRate24h: p._fr24, sigma, poolAgeH: p._poolAgeH,
         surge: p._sg, accel: p._ac, org: metric(t.organicScore), orgBuy1h: buy1,
         path, ageH, ofi, ofi6, tvl: Number(p.tvl), audit, px, low, low6h, dd,
         binStepBps: Number(p.pool_config?.bin_step),

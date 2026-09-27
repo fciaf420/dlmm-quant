@@ -423,6 +423,12 @@
     const baseUrl = String(options.baseUrl || 'https://dlmm.datapi.meteora.ag').replace(/\/$/, '');
     const cache = new Map();
     const inflight = new Map();
+    // BUCKET-BOUNDARY STALENESS (mirror of meteora-quant-lens): datapi can take a few
+    // seconds to publish the just-closed 5m candle. A fetch landing in that gap returns
+    // WAIT 'stale-history', and the same-bucket cache used to serve that WAIT for the
+    // whole 5 minutes - so a BID ASK candidate sat blocked for a bucket on a publish
+    // delay. Such a WAIT is retried after STALE_RETRY_MS instead.
+    const STALE_RETRY_MS = 20 * 1000;
 
     const isContinuous = (candles) => candles.every((c, i) => i === 0
       || c.timestamp - candles[i - 1].timestamp === timeframeSec);
@@ -450,8 +456,11 @@
       const desiredStart = Math.max(currentBucket - expectedBars * timeframeSec,
         creationKnown ? Math.ceil(createdValue / timeframeSec) * timeframeSec : 0);
       let entry = cache.get(address);
+      const staleRetry = !!entry && !!entry.analysis && entry.analysis.state === 'WAIT'
+        && entry.analysis.reason === 'stale-history'
+        && !(now - (entry.fetchedAt || 0) < STALE_RETRY_MS);
       if (entry && entry.bucket === currentBucket && entry.poolCreatedAt === (creationKnown ? createdValue : null)
-          && (!entry.seeded || entry.analysis.state !== 'WAIT')) {
+          && (!entry.seeded || entry.analysis.state !== 'WAIT') && !staleRetry) {
         touch(address, entry);
         return { analysis: entry.analysis, candles: entry.candles.slice() };
       }
@@ -525,7 +534,7 @@
         ? analyzeCandleHistory(preparedWithAge.candles, analysisOptions)
         : emptyAnalysis(preparedWithAge);
       entry = { bucket: currentBucket, candles: preparedWithAge.candles, analysis,
-        poolCreatedAt: creationKnown ? createdValue : null, seeded: false };
+        poolCreatedAt: creationKnown ? createdValue : null, seeded: false, fetchedAt: now };
       touch(address, entry);
       return { analysis, candles: preparedWithAge.candles.slice() };
     }
