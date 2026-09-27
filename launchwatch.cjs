@@ -20,6 +20,7 @@ const DIR = __dirname;
 const { JUP_KEY: JK, CFG } = require("./config.cjs");
 const { fetchVolDay, sigmaFrom } = require("./vol.cjs");
 const GATES = require("./gates.cjs");           // same detectors the daemon deploys by
+const RATES = require('./rates.cjs');           // pool-age-aware window rates (observer: tag, never block)
 const MET = "https://dlmm.datapi.meteora.ag";
 const SOLM = CFG.QUOTE_MINT;
 
@@ -54,7 +55,10 @@ async function tick() {
     const ageH = p.created_at ? (now - p.created_at)/3600e3 : 999;
     return p.token_y?.address === SOLM && ageH <= LW.MAX_AGE_H && (p.tvl||0) >= LW.MIN_TVL;
   });
-  B.forEach(p=>{ p._fr=(p.fee_tvl_ratio?.["1h"]||0)*24; p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=(p.volume?.["30m"]*48)/Math.max(p.volume?.["4h"]*6,1); });
+  // pool-age-aware (rates.cjs): these pools are minutes-to-hours old, so the 1h/4h windows
+  // usually hold only the pool's lifetime - the old *24 and fixed-4h divisors understated fr
+  // and inflated accel on exactly the rows this observer exists to record
+  B.forEach(p=>{ p._poolAgeH=RATES.poolAgeHours(p.created_at, now); p._fr=RATES.windowPerDay(p.fee_tvl_ratio?.["1h"]||0, 1, p._poolAgeH); p._sg=(p.dynamic_fee_pct||0)/(p.pool_config?.base_fee_pct||1); p._ac=RATES.accelFrom(p.volume?.["30m"]||0, p.volume?.["4h"]||0, p._poolAgeH); });
   B.sort((a,b)=>b._fr-a._fr);
   const cands = B.slice(0, LW.TOP_N);
   log(`tick: ${(bd.data||bd).length} pools -> ${B.length} launch-phase (<${LW.MAX_AGE_H}h, SOL-quoted) -> evaluating top ${cands.length}`);
@@ -90,7 +94,10 @@ async function tick() {
         sigma:+sigma.toFixed(1), src, edge:+edge.toFixed(3), ofi:+ofi.toFixed(2), ofi6:+ofi6.toFixed(2), org:Math.round(org),
         path, ageH:+ageH.toFixed(2), dd: dd!=null?Math.round(dd):null, pos: pos!=null?+pos.toFixed(2):null,
         pc5:+pc5.toFixed(1), pc1:+pc1.toFixed(1), px, rawW:+rawW.toFixed(1), sqzR, binStep:p.pool_config?.bin_step??null,
-        mint: p.token_x.address, would }) + '\n');
+        mint: p.token_x.address, would,
+        // the daemon would HOLD a sub-1h pool regardless of `would` (gates.cjs launch hold);
+        // basis tags keep these rows separable from pre-fix observations in replay/launchlab
+        launchHold: RATES.launchHeld(p._poolAgeH), eb: RATES.EDGE_BASIS, fb: RATES.FEE_BASIS }) + '\n');
       log(`  ${(p.name||'?').padEnd(16).slice(0,16)} pool ${((now-(p.created_at||now))/60e3).toFixed(0).padStart(3)}m fr ${p._fr.toFixed(0).padStart(4)} sigma ${sigma.toFixed(0).padStart(4)} edge ${edge.toFixed(2).padStart(5)} surge ${p._sg.toFixed(2)} org ${String(Math.round(org)).padStart(3)} ${path.padEnd(9)} ${would?'=> WOULD '+would:''}`);
       await sleep(LW.THROTTLE);
     } catch(e) { log(`  err ${p.name}: ${e.message}`); }

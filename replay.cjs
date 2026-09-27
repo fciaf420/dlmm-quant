@@ -13,12 +13,30 @@
 // mean PnL clears --friction (%, default 0.4: measured round-trip cost).
 //
 // APPROXIMATIONS (ranking-grade, not penny-grade): uniform two-sided payoff with
-// upside capped at W/4 and downside ~0.75x to band-break then 1:1 below; fees =
+// upside capped at ~W/4 and downside ~0.75x to band-break then 1:1 below; fees =
 // pool fees x (your notional / TVL) while in range; OOR granularity is 2x30m
 // candles vs the daemon's 2x2min ticks. Observations of the same pool overlap
 // in time, so treat n as optimistic.
 const fs = require('fs');
+const RATES = require('./rates.cjs');
 const DIR = __dirname;
+
+// BASIS CONVERSION (2026-09-27, mirror of meteora-quant-lens v0.7.12): rows logged before
+// the `eb`/`fb` tags used edge = fr*0.9/(1.3*s^2/(8W)) and full-window fee divisors. The
+// live gates now use fr/(1.3*s^2/(4W)) with pool-age-aware fr, so bucketing raw legacy
+// edges against today's thresholds would overstate every legacy bucket by 9/5. The edge
+// conversion is exact (x5/9). The old FEE basis only differs for pools under 1h old
+// (their fr was understated by poolAge/1h); rows carrying poolAgeH are corrected, the
+// rest cannot be and are counted in the report.
+// poolAgeH = daemon/launchwatch rows; pAgeH = Quant Lens shadow exports
+const ageOf = (row) => (Number.isFinite(row.poolAgeH) ? row.poolAgeH : row.pAgeH);
+const legacyFeeFix = (row) => (row.fb !== RATES.FEE_BASIS && Number.isFinite(ageOf(row)) && ageOf(row) < 1)
+  ? 1 / Math.max(ageOf(row), RATES.MIN_COVERED_H) : 1;
+const frV1 = (row) => Number.isFinite(row.fr) ? row.fr * legacyFeeFix(row) : row.fr;
+function edgeV1(row) {
+  if (!Number.isFinite(row.edge) || row.eb === RATES.EDGE_BASIS) return row.edge;
+  return row.edge * RATES.LEGACY_EDGE_TO_V1 * legacyFeeFix(row);
+}
 const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? +process.argv[i + 1] : d; };
 const MAX = arg('max', 150), FRICTION = arg('friction', 0.4);
 const HORIZON_H = { IGNITION: 6, BASING: 24, CARRY: 48, SQUEEZE: 24 };
@@ -38,8 +56,9 @@ async function simulate(row) {
   if (row.sig === 'BID_ASK' || row.profile === 'ACCUM') return { skip: 'unsupported-accum-profile' };
   const cls = row.sig || 'IGNITION';
   const W = (row.w || Math.min(30, Math.max(12, Math.round(row.sigma / 4)))) / 100;
-  const tp = row.sig ? null : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + row.fr * 0.5)));  // cap-aware
-  const tpPct = tp != null ? tp : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + row.fr * 0.5)));
+  const fr = frV1(row);
+  const tp = row.sig ? null : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + fr * 0.5)));  // cap-aware (~W/4)
+  const tpPct = tp != null ? tp : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + fr * 0.5)));
   const slPct = Math.min(20, Math.max(8, Math.round(0.75 * W * 100 + 2)));
   const t0 = Math.floor(row.t / 1000);
   const t1 = t0 + (HORIZON_H[cls] || 6) * 3600;
@@ -54,7 +73,7 @@ async function simulate(row) {
   const p0 = Number(candles[0].open) || Number(candles[0].close);
   if (!(p0 > 0) || !(row.tvl > 0)) return { skip: 'bad-entry' };
   let pnl = 0, feePnl = 0, oorRun = 0, decayRun = 0, trigger = 'HORIZON';
-  const entryFr = row.fr;
+  const entryFr = fr;
   for (const c of candles) {
     const r = Number(c.close) / p0;
     const inRange = Math.abs(r - 1) <= W;
@@ -71,7 +90,7 @@ async function simulate(row) {
     if (oorRun >= 2) { trigger = r > 1 ? 'OOR-UP' : 'OOR-DOWN'; break; }
     if (decayRun >= 2) { trigger = 'FEE-DECAY'; break; }
   }
-  return { cls, pnl: +pnl.toFixed(2), trigger, edge: row.edge, gates: { sg: row.sg, ac: row.ac, org: row.org, path: row.path } };
+  return { cls, pnl: +pnl.toFixed(2), trigger, edge: edgeV1(row), eb: RATES.EDGE_BASIS, gates: { sg: row.sg, ac: row.ac, org: row.org, path: row.path } };
 }
 
 (async () => {
@@ -109,6 +128,12 @@ async function simulate(row) {
   console.log(`shadow log: ${rows.length} observations | replayed: ${Object.keys(cache).length} (${fetched} new this run) | usable: ${done.length}\n`);
   if (accumSkipped) console.log(`BID ASK/ACCUM skipped: ${accumSkipped} (hybrid inventory and exit model not implemented)\n`);
   if (!done.length) return;
+  {
+    const legacy = done.filter((x) => x.row.eb !== RATES.EDGE_BASIS);
+    const unknownAge = legacy.filter((x) => x.row.fb !== RATES.FEE_BASIS && !Number.isFinite(ageOf(x.row))).length;
+    console.log(`edge basis: ${RATES.EDGE_BASIS} (fr/(1.3*s^2/4W)) | ${done.length - legacy.length} native rows, ${legacy.length} legacy rows rescaled x${RATES.LEGACY_EDGE_TO_V1.toFixed(4)}`
+      + (unknownAge ? ` | ${unknownAge} legacy rows lack poolAgeH: if their pool was <1h old, fr/edge stay understated` : '') + '\n');
+  }
 
   const BUCKETS = [[0, 0.5], [0.5, 1], [1, 1.5], [1.5, 2], [2, 3], [3, 99]];
   for (const cls of [...new Set(done.map((x) => x.res.cls))]) {
@@ -117,7 +142,7 @@ async function simulate(row) {
     console.log('  edge      n    win%   meanPnL   triggers');
     let gate = null;
     for (const [lo, hi] of BUCKETS) {
-      const B = D.filter((x) => x.row.edge >= lo && x.row.edge < hi);
+      const B = D.filter((x) => edgeV1(x.row) >= lo && edgeV1(x.row) < hi);
       if (!B.length) continue;
       const pnls = B.map((x) => x.res.pnl);
       const mean = pnls.reduce((a, b) => a + b, 0) / pnls.length;
@@ -133,7 +158,7 @@ async function simulate(row) {
     console.log('');
   }
   // near-miss audit: would-have-been IGNITIONs blocked ONLY by surge or accel
-  const nm = done.filter((x) => !x.row.sig && x.row.edge >= 1 && x.row.org >= 40 && x.row.path !== 'FREEFALL' && (x.row.sg < 1.25 || x.row.ac < 1.2));
+  const nm = done.filter((x) => !x.row.sig && edgeV1(x.row) >= 1 && x.row.org >= 40 && x.row.path !== 'FREEFALL' && (x.row.sg < 1.25 || x.row.ac < 1.2));
   const fp = done.filter((x) => x.row.sig === 'IGNITION');
   if (nm.length >= 5) {
     const m = (a) => a.reduce((s, x) => s + x.res.pnl, 0) / a.length;

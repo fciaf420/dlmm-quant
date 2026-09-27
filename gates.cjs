@@ -5,6 +5,7 @@
 // Numbers here are the daemon's real thresholds — editing them changes LIVE deploys.
 
 const { qualifyBidAskCandle } = require('./candle_analysis.cjs');
+const RATES = require('./rates.cjs');
 
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 
@@ -18,13 +19,18 @@ function classifyPath({ pc5, pc1, dd, pos }) {
 }
 
 // Pool-level fee-yield vs realized-vol heuristic (fr = daily fee %, sigma =
-// daily vol %, widthPct = the width the recipe can actually deploy). This is
+// daily vol %, widthPct = the HALF-width the recipe can actually deploy). This is
 // not a position simulator: shape, directional inventory, costs and fill path
 // are deliberately outside this proxy.
+// EDGE MATH FIX 2026-09-27 (mirror of meteora-quant-lens): fr is already LP-net
+// (no *0.9) and a uniform +-W band's IL is sigma^2/(4W), not sigma^2/(8W) - see
+// rates.cjs for the live proof and the bin simulation. edge = fr / (1.3 * IL).
+// Thresholds below are deliberately UNCHANGED: on identical inputs every edge is
+// now 5/9 of the old number, i.e. entries need ~1.8x the fees they used to.
 const edgeFrom = (fr, sigma, widthPct = 20) => {
   if (![fr, sigma, widthPct].every(Number.isFinite) || sigma <= 0 || widthPct <= 0) return 0;
-  return ((fr * 0.9) / Math.max(sigma, .001))
-    / Math.max(1.3 * sigma / (8 * widthPct), .001);
+  return ((fr * RATES.LP_FEE_SHARE) / Math.max(sigma, .001))
+    / Math.max(RATES.EDGE_SAFETY * sigma / (RATES.IL_DENOM * widthPct), .001);
 };
 
 const ignition = ({ edge, sg, ac, org, path, ageH, ofi }) =>
@@ -121,7 +127,9 @@ function bidAskSignal(d, now = Date.now()) {
     auth: d.mintAuthorityDisabled === true && d.freezeAuthorityDisabled === true,
     top10: finite(d.topHoldersPct) && d.topHoldersPct <= 35,
     flow: finite(d.orgBuy1h) && d.orgBuy1h > 0,
-    fees: finite(d.feeRate1h) && finite(d.feeRate24h)
+    // feeRate24h is pool-age-aware (since-launch %/day on a sub-day pool). Under an
+    // hour of fees there is no history to measure persistence against: hold.
+    fees: !RATES.launchHeld(d.poolAgeH) && finite(d.feeRate1h) && finite(d.feeRate24h)
       && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h,
     path: knownPath && finite(d.ofi1h) && !(d.path === 'FREEFALL' && d.ofi1h >= 1.43),
   };
@@ -202,8 +210,14 @@ function updateFeeDecay(previous, row, snapshot) {
 
 function collectSignals({ data: d, config: c, now = Date.now() }) {
   d = d || {}; c = c || {};
-  const out = { trade: null, bidAsk: null, bidAskStatus: null, recipeEdges: {} };
-  const dataFresh = d.ok === true && finite(d.ts) && now >= d.ts && now - d.ts <= BID_ASK_FRESH_MS;
+  const out = { trade: null, bidAsk: null, bidAskStatus: null, recipeEdges: {},
+    poolAgeH: finite(d.poolAgeH) ? d.poolAgeH : null, launchHold: RATES.launchHeld(d.poolAgeH) };
+  // LAUNCH HOLD (mirror of meteora-quant-lens v0.7.12): every class is priced off the
+  // pool fee rate, and under 1h that rate is minutes of launch trading scaled to a day
+  // (now correctly scaled, i.e. LARGER than the old understated read). No class may
+  // deploy on it; edges are still computed so logs/shadow show what it would have been.
+  const dataFresh = d.ok === true && finite(d.ts) && now >= d.ts && now - d.ts <= BID_ASK_FRESH_MS
+    && !out.launchHold;
   if (d.supportedSolPair !== true || !finite(d.binStepBps) || d.binStepBps <= 0
       || !finite(d.sigma) || d.sigma <= 0 || !finite(d.feeRate1h)) return out;
   const rawW = basingFloor({ px: d.px, low: d.low, low6h: d.low6h }).rawW;
@@ -227,6 +241,7 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
     label, profile: 'TRADE', mode, shape: 'spot', range, widthBins: range.widthBins,
     widthPct: range.effectiveWidthPct, wantedPct, size, tp, sl, stop,
     edge: out.recipeEdges[label], edgeModel: 'pool-width heuristic; shape and execution costs unmodeled',
+    edgeBasis: RATES.EDGE_BASIS,
   });
   if (dataFresh && ignitionRange && ignition({ edge: ignitionEdge, sg: d.surge, ac: d.accel, org: d.org, path: d.path, ageH: d.ageH, ofi: d.ofi })) {
     const W = ignitionRange.effectiveWidthPct;
@@ -259,7 +274,7 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
   const ba = bidAskSignal({
     ok: d.ok, ts: d.ts, supportedSolPair: d.supportedSolPair,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
-    orgBuy1h: d.orgBuy1h, feeRate1h: d.feeRate1h, feeRate24h: d.feeRate24h,
+    orgBuy1h: d.orgBuy1h, feeRate1h: d.feeRate1h, feeRate24h: d.feeRate24h, poolAgeH: d.poolAgeH,
     path: d.path, ofi1h: d.ofi, sigma: d.sigma, ddHigh: d.dd,
     candleAnalysis: d.candleAnalysis,
   }, now);

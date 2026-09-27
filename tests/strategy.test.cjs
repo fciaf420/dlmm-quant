@@ -14,8 +14,10 @@ function qualifiedCandleAnalysis(now = 2_000_000) {
 }
 
 test('EDGE uses the width that the recipe actually deploys', () => {
-  const settingsEdge = GATES.edgeFrom(5.2, 30, 35);
-  const recipeEdge = GATES.edgeFrom(5.2, 30, 12);
+  // fr 9.36 = the old 5.2 x 9/5: the 2026-09-27 edge fix (LP-net fees, IL = s^2/4W) makes
+  // every edge 5/9 of the old value, so this reproduces the original 1.12 / 0.38 split.
+  const settingsEdge = GATES.edgeFrom(9.36, 30, 35);
+  const recipeEdge = GATES.edgeFrom(9.36, 30, 12);
   assert.ok(settingsEdge > 1);
   assert.ok(recipeEdge < 1);
   assert.equal(GATES.ignition({ edge: recipeEdge, sg: 1.3, ac: 1.3, org: 80, path: 'CHOP', ageH: 100, ofi: 1 }), false);
@@ -119,7 +121,8 @@ test('one pool can surface a trade and BID ASK signal independently', () => {
     now: 2_000_000,
     data: {
       ok: true, ts: 1_990_000, supportedSolPair: true,
-      feeRate1h: 20, feeRate24h: 12, sigma: 30,
+      // feeRate1h 36 = the old 20 x 9/5 (edge-math fix): same IGNITION edge (~1.39) as before
+      feeRate1h: 36, feeRate24h: 12, sigma: 30,
       surge: 1.4, accel: 1.3, org: 80, orgBuy1h: 100,
       path: 'CHOP', ageH: 100, ofi: 1, ofi6: 0.8,
       tvl: 200_000, audit: { mintAuthorityDisabled: true, freezeAuthorityDisabled: true, topHoldersPercentage: 20 },

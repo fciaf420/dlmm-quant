@@ -20,17 +20,24 @@ npm start              # go live
 
 When you LP a DLMM pool, you're not "earning yield" — **you're selling insurance against price movement**. Fees are the premium you collect; impermanent loss is the claim you pay out when price actually moves. Most LPs never check whether the premium covers the claims.
 
-The TRADE profiles use this pool-level screening approximation for a position of width `W`:
+The TRADE profiles use this pool-level screening approximation for a uniform band of half-width `W` (±W%):
 
 ```
-expected IL/day ≈ σ² / 8W        (σ = realized volatility, %/day)
+expected IL/day ≈ σ² / 4W        (σ = realized volatility, %/day; W = half-width, %)
 ```
 
 This gives the TRADE screener a fee-versus-volatility comparison:
 
 ```
-edge = (net fee rate / σ)  ÷  (1.3 × σ / 8W)
+edge = (LP fee rate / σ)  ÷  (1.3 × σ / 4W)   =   LP fee rate ÷ (1.3 × expected IL)
 ```
+
+**Edge math fix (2026-09-27).** The formula used to be `σ²/8W` with an extra `×0.9` protocol haircut. Both were wrong, and together they overstated every edge by 9/5:
+
+- A uniform ±W band's delta falls linearly across 2W, so gamma = V/2W and E[IL] = ½·gamma·σ² = **σ²/4W** (the same answer as Uniswap-v3's narrow-range LVR). A DLMM bin simulation (uniform liquidity per bin, W=20%) fits IL ≈ 1.42·ln(p)² vs 1/(4w)=1.25 vs the old 1/(8w)=0.625, so σ²/4W is, if anything, still slightly generous.
+- Meteora's `fee_tvl_ratio` is **already net of the protocol cut**: on SOL-USDC with a 0.04% base fee, `fees/volume` = 0.0382% (below the minimum fee, so it cannot be gross) and `(fees + protocol_fees)/volume` = 0.0424%. Protocol share ≈ 10% standard / ≈20% on launch pools, already taken out.
+
+Thresholds were **not** retuned: `edge ≥ 1.0` now honestly means LP fees ≥ 1.3× modeled IL. On identical inputs every edge is 5/9 of what the pre-fix daemon printed, so entries need ~1.8× the fees. Shadow rows carry `eb: 'il4w-net-v1'`; `replay.cjs` rescales older rows by exactly 5/9 before bucketing so the two bases never mix.
 
 `edge ≥ 1.0` is the configured heuristic threshold. It is not a profit forecast. The model does not include exact bin shape, directional inventory, swap/priority fees, slippage, rewards, or position-specific fill path. BID ASK is an accumulation profile and does not use this symmetric TRADE proxy.
 
@@ -55,13 +62,25 @@ If σ falls back to the legacy estimator on 2+ *mature* tokens in one scan, cand
 
 | Signal | Question it answers | Source |
 |---|---|---|
-| **feeRate** | What's the pool paying *right now* (last hour annualized), not yesterday? | Meteora Data API |
+| **feeRate** | What's the pool paying *right now* (last hour annualized), not yesterday? Pool-age-aware: see *Young pools* below | Meteora Data API |
 | **σ (sigma)** | How violently does this thing actually move? | OHLCV candles (see above) |
 | **edge** | Do fees beat expected IL? | computed |
 | **surge** | Is the on-chain dynamic-fee accumulator elevated? DLMM raises fees during volatility — deploy when the premium is surged, not after it decays | Meteora |
 | **accel** | Is volume accelerating (30-min pace vs 4-hour pace) or fading? Catalysts, not leftovers | Meteora |
 | **OFI** | Are *organic* wallets (Jupiter filters out bots) net buying or net selling? Don't be someone's exit liquidity | Jupiter |
 | **path** | Where is price in its recent story? Labels each pool `FREEFALL / BASING / BLOWOFF / GRIND-UP / CHOP` | OHLCV |
+
+### Young pools (pool age, not token age)
+
+Meteora's windows (30m, 1h, 2h, 4h, 12h, 24h) can only cover the time the **pool** has existed. On a 1.7h-old pool the 2h/4h/12h/24h numbers are all the same since-creation total. Every window-based rate is divided by the hours it actually covered (`value × 24 ÷ min(window, pool age)`, 15-minute floor), in `rates.cjs`:
+
+| Pool age | Treatment |
+|---|---|
+| under 1h | **Launch hold**: no class deploys (fee rate is minutes of launch trading), scan gives these pools no slot. `launchwatch.cjs` still observes them and tags `launchHold`. |
+| 1h–24h | Real %/day; the "24h" normal (BID ASK fee persistence, FEE-DECAY's below-normal guard) is fees since launch ÷ pool age. |
+| 24h+ | Unchanged. |
+
+Caught live on NEARPAD-SOL (2026-09-27): 6.4% of fees in 1.7h was read as 6.4%/day (really ~91%/day). That failed BID ASK fee persistence on nearly every sub-day pool and stamped `entryFeeRate24h` so low that FEE-DECAY could not arm on young-pool positions. Registry rows are now stamped `feeBasis: 'pool-age-v1'`; older rows are rescaled by pool age at `openedAt` when read (never rewritten). Accel had the same bug (fixed 4h divisor, ~2.4× inflated on a 1.7h pool).
 
 ### Completed-candle pullback evidence
 
@@ -125,7 +144,7 @@ Existing SQUEEZE rows remain TRADE positions and retain their saved exits/time-s
 
 ### Cap-aware take-profits
 
-In the replay's simplified uniform two-sided payoff model, price-driven gain approaches a cap near **W/4** once inventory has converted to SOL. The TRADE recipes use that approximation to avoid setting brackets far beyond their modeled band payoff. Actual reachability still depends on DLMM bin shape, fill path, fees, slippage, and costs; pump-outs are normally booked by the out-of-range rule.
+In the replay's simplified uniform two-sided payoff model, price-driven gain approaches a cap of **about W/4** once inventory has converted to SOL (a DLMM bin simulation gives 4.5% vs 5% at W=20% and 7.4% vs 8.75% at W=35%, so it is slightly optimistic for wide bands). The TRADE recipes use that approximation to avoid setting brackets far beyond their modeled band payoff. Actual reachability still depends on DLMM bin shape, fill path, fees, slippage, and costs; pump-outs are normally booked by the out-of-range rule.
 
 ## The lifecycle
 
@@ -324,7 +343,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dlmm.quant-trader.pl
 
 ## Honest limitations
 
-- The IL formula is a diffusion approximation, not exact bin math
+- The IL formula is a diffusion approximation, not exact bin math (σ²/4W; a bin simulation runs ~10-20% above it)
 - EDGE is a pool/width heuristic. It does not model the deployed shape, directional inventory, per-bin competition, rewards, swap/priority fees, slippage, or transaction/rent opportunity cost. BID ASK has no profitability model or validated backtest in this release
 - A BID ASK layer validates that every saved bin is at or below the active bin immediately before building, but the SDK transaction permits bounded active-bin movement while it lands. A downward move can pause the next layer; the journal remains for later resume or manual close
 - Replay simulation is ranking-grade, not penny-grade: uniform-band payoff approximation, 30-minute exit granularity vs the daemon's 2-minute ticks, no execution costs, and same-pool observations overlap in time so `n` runs optimistic

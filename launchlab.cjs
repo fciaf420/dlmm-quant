@@ -23,7 +23,8 @@ const CACHE = DIR + '/launchlab-cache.json';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ---- payoff models -------------------------------------------------------
-// TWO-SIDED, uniform: upside caps at W/4 (token half converts out as price climbs),
+// TWO-SIDED, uniform: upside caps at ~W/4 (token half converts out as price climbs;
+// a DLMM bin sim gives 4.5% vs 5% at W=20%, 7.4% vs 8.75% at W=35%),
 // downside ~0.75x to band break then 1:1 below. Verbatim from replay.cjs.
 function pnlTwoSided(r, W) {
   const d = r - 1;

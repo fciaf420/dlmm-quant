@@ -7,6 +7,7 @@ const { Connection, Keypair, PublicKey, VersionedTransaction } = require('@solan
 const BN = require('bn.js');
 const { sendConfirm, confirmSig } = require('./sendtx.cjs');
 const GATES = require('./gates.cjs');
+const RATES = require('./rates.cjs');
 const { makeBidAskJournal, runBidAskPhases, validateFundingRange, phaseLiquidity,
   reconcileSubmitted, matchesJournalRow, remainingPrincipalLamports } = require('./bid_ask_exec.cjs');
 const { RPC_URL, JUP_KEY: JK, keypair, CFG } = require("./config.cjs");
@@ -165,8 +166,11 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
         depthPct: +arg('depthPct', String(widthPct)), anchorBinId: active.binId,
         minBinId: active.binId - widthBins, maxBinId: active.binId,
         totalBins, extended, entryPrice: pool.current_price,
-        entryFeeRate: Number(pool.fee_tvl_ratio?.['1h']) * 24,
-        entryFeeRate24h: Number(pool.fee_tvl_ratio?.['24h']),
+        // pool-age-aware (rates.cjs): on a sub-day pool the "24h" normal is its lifetime
+        // total, not a day - stamped with feeBasis so manage() never rescales it twice
+        entryFeeRate: RATES.windowPerDay(pool.fee_tvl_ratio?.['1h'], 1, RATES.poolAgeHours(pool.created_at)),
+        entryFeeRate24h: RATES.windowPerDay(pool.fee_tvl_ratio?.['24h'], 24, RATES.poolAgeHours(pool.created_at)),
+        feeBasis: RATES.FEE_BASIS,
       });
       writeJsonAtomic(BID_ASK_PENDING, pendingBidAsk);
     }
@@ -190,6 +194,9 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
         sizeSOL: pendingBidAsk.sizeLamports / 1e9, bidAskPct: pendingBidAsk.bidAskPct, spotPct: pendingBidAsk.spotPct,
         depthPct: pendingBidAsk.depthPct, entryPrice: pendingBidAsk.entryPrice,
         entryFeeRate: pendingBidAsk.entryFeeRate, entryFeeRate24h: pendingBidAsk.entryFeeRate24h,
+        // a journal written by the pre-fix deploy has no feeBasis: leave it unstamped so
+        // manage() applies the legacy pool-age rescale to those baselines
+        ...(pendingBidAsk.feeBasis ? { feeBasis: pendingBidAsk.feeBasis } : {}),
         tpPct: 0, slPct: 0, stopPrice: 0,
         minBinId: pendingBidAsk.minBinId, maxBinId: pendingBidAsk.maxBinId,
         funded: phaseState() === 'COMPLETE', deploymentState: phaseState(),
@@ -401,8 +408,13 @@ process.on('SIGINT', () => console.error('SIGINT ignored - finishing deploy to k
   function record({ funded }) {
     const reg = fs.existsSync(__dirname+'/positions.json') ? JSON.parse(fs.readFileSync(__dirname+'/positions.json','utf8')) : [];
     const row = { pool: POOL, name: pool.name, mint: MINT, position: posKp.publicKey.toBase58(), label, profile, mode,
-      sizeSOL: size, entryPrice: pool.current_price, entryFeeRate: (pool.fee_tvl_ratio['1h']||0)*24,
-      entryFeeRate24h: pool.fee_tvl_ratio['24h']||0,   // the pool's NORMAL level (spike-bias guard for FEE-DECAY)
+      sizeSOL: size, entryPrice: pool.current_price,
+      // pool-age-aware (rates.cjs, caught live 2026-09-27 NEARPAD): the old raw '24h' read
+      // stored a 1.7h pool's lifetime total (6.4) as its daily NORMAL (~91), so FEE-DECAY's
+      // below-normal guard could never arm on young-pool positions
+      entryFeeRate: RATES.windowPerDay(pool.fee_tvl_ratio['1h']||0, 1, RATES.poolAgeHours(pool.created_at)),
+      entryFeeRate24h: RATES.windowPerDay(pool.fee_tvl_ratio['24h']||0, 24, RATES.poolAgeHours(pool.created_at)),   // the pool's NORMAL level (spike-bias guard for FEE-DECAY)
+      feeBasis: RATES.FEE_BASIS, edgeBasis: RATES.EDGE_BASIS,
       tpPct: tp, slPct: sl, stopPrice, minBinId, maxBinId, funded,
       widthBins, widthPct: effPct, edgeModel: 'pool-width heuristic; shape and execution costs unmodeled',
       openedAt: new Date().toISOString() , shape: arg('shape','spot') };
