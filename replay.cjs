@@ -1,5 +1,5 @@
 // replay.cjs — counterfactual review of the shadow log (shadow.jsonl).
-// Usage: node replay.cjs [--max 150] [--friction 0.4]
+// Usage: node replay.cjs [--max 150] [--friction 0.4] [--no-backfill]
 //
 // For every logged scan evaluation old enough to have a full forward window, this
 // simulates the class recipe (or the IGNITION recipe for non-signals) against the
@@ -19,28 +19,24 @@
 // in time, so treat n as optimistic.
 const fs = require('fs');
 const RATES = require('./rates.cjs');
+const { createPoolCreatedResolver, needsPoolAge } = require('./pool_created.cjs');
 const DIR = __dirname;
 
 // BASIS CONVERSION (2026-09-27, mirror of meteora-quant-lens v0.7.12): rows logged before
-// the `eb`/`fb` tags used edge = fr*0.9/(1.3*s^2/(8W)) and full-window fee divisors. The
-// live gates now use fr/(1.3*s^2/(4W)) with pool-age-aware fr, so bucketing raw legacy
-// edges against today's thresholds would overstate every legacy bucket by 9/5. The edge
-// conversion is exact (x5/9). The old FEE basis only differs for pools under 1h old
-// (their fr was understated by poolAge/1h); rows carrying poolAgeH are corrected, the
-// rest cannot be and are counted in the report.
-// poolAgeH = daemon/launchwatch rows; pAgeH = Quant Lens shadow exports
-const ageOf = (row) => (Number.isFinite(row.poolAgeH) ? row.poolAgeH : row.pAgeH);
-const legacyFeeFix = (row) => (row.fb !== RATES.FEE_BASIS && Number.isFinite(ageOf(row)) && ageOf(row) < 1)
-  ? 1 / Math.max(ageOf(row), RATES.MIN_COVERED_H) : 1;
-const frV1 = (row) => Number.isFinite(row.fr) ? row.fr * legacyFeeFix(row) : row.fr;
-function edgeV1(row) {
-  if (!Number.isFinite(row.edge) || row.eb === RATES.EDGE_BASIS) return row.edge;
-  return row.edge * RATES.LEGACY_EDGE_TO_V1 * legacyFeeFix(row);
-}
+// the `eb`/`fb` tags used edge = fr*0.9/(1.3*s^2/(8W)) (one-sided IGNITION bands priced
+// as if two-sided) and full-window fee divisors. Bucketing raw legacy edges against today's
+// thresholds would overstate them. rates.cjs legacyRowToV1 is the ONE conversion (shared
+// with launchlab.cjs): x5/9, x0.5 more for an identifiable one-sided band, and the
+// pool-age fee fix when the pool age at the row is known - logged, or backfilled from the
+// pool's immutable created_at (pool_created.cjs, cached in pool-created.json).
+// REPLAY CACHE: entries carry v = RATES.REPLAY_CACHE_VERSION; anything simulated under an
+// older basis (fr understated on young pools) is a miss and gets re-simulated.
 const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? +process.argv[i + 1] : d; };
-const MAX = arg('max', 150), FRICTION = arg('friction', 0.4);
 const HORIZON_H = { IGNITION: 6, BASING: 24, CARRY: 48, SQUEEZE: 24 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rowKey = (row) => row.t + ':' + row.pool;
+// a cached simulation is reusable only if it was produced under the current basis
+const cachedResult = (cache, row) => (RATES.replayCacheHit(cache[rowKey(row)]) ? cache[rowKey(row)] : null);
 
 function pnlPrice(r, W) {  // W as fraction (0.15 = ±15%)
   const d = r - 1;
@@ -49,29 +45,30 @@ function pnlPrice(r, W) {  // W as fraction (0.15 = ±15%)
   return -0.75 * W + (d + W);                                      // fully converted: 1:1 below the band
 }
 
-async function simulate(row) {
+async function simulate(row, conv, fetchImpl = fetch) {
   // BID ASK is a quote-only, two-shape accumulation profile with a conjunctive
   // fee-decay+distribution exit. The uniform two-sided TRADE payoff below does
   // not model its inventory path, so never turn these rows into fake evidence.
-  if (row.sig === 'BID_ASK' || row.profile === 'ACCUM') return { skip: 'unsupported-accum-profile' };
+  if (row.sig === 'BID_ASK' || row.profile === 'ACCUM') return { skip: 'unsupported-accum-profile', v: RATES.REPLAY_CACHE_VERSION };
   const cls = row.sig || 'IGNITION';
   const W = (row.w || Math.min(30, Math.max(12, Math.round(row.sigma / 4)))) / 100;
-  const fr = frV1(row);
+  conv = conv || RATES.legacyRowToV1(row);
+  const fr = conv.fr;
   const tp = row.sig ? null : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + fr * 0.5)));  // cap-aware (~W/4)
   const tpPct = tp != null ? tp : Math.min(25, Math.max(4, Math.round(W * 100 / 4 + fr * 0.5)));
   const slPct = Math.min(20, Math.max(8, Math.round(0.75 * W * 100 + 2)));
   const t0 = Math.floor(row.t / 1000);
   const t1 = t0 + (HORIZON_H[cls] || 6) * 3600;
   const [oh, vh] = await Promise.all([
-    fetch(`https://dlmm.datapi.meteora.ag/pools/${row.pool}/ohlcv?timeframe=30m&start_time=${t0}&end_time=${t1}`).then((r) => r.json()).catch(() => null),
-    fetch(`https://dlmm.datapi.meteora.ag/pools/${row.pool}/volume/history?timeframe=30m&start_time=${t0}&end_time=${t1}`).then((r) => r.json()).catch(() => null)
+    fetchImpl(`https://dlmm.datapi.meteora.ag/pools/${row.pool}/ohlcv?timeframe=30m&start_time=${t0}&end_time=${t1}`).then((r) => r.json()).catch(() => null),
+    fetchImpl(`https://dlmm.datapi.meteora.ag/pools/${row.pool}/volume/history?timeframe=30m&start_time=${t0}&end_time=${t1}`).then((r) => r.json()).catch(() => null)
   ]);
   const candles = (oh && oh.data) || [];
-  if (candles.length < 3) return { skip: 'no-candles' };
+  if (candles.length < 3) return { skip: 'no-candles', v: RATES.REPLAY_CACHE_VERSION };
   const feeByTs = {};
   for (const v of ((vh && vh.data) || [])) feeByTs[v.timestamp] = Number(v.fees || 0);
   const p0 = Number(candles[0].open) || Number(candles[0].close);
-  if (!(p0 > 0) || !(row.tvl > 0)) return { skip: 'bad-entry' };
+  if (!(p0 > 0) || !(row.tvl > 0)) return { skip: 'bad-entry', v: RATES.REPLAY_CACHE_VERSION };
   let pnl = 0, feePnl = 0, oorRun = 0, decayRun = 0, trigger = 'HORIZON';
   const entryFr = fr;
   for (const c of candles) {
@@ -90,10 +87,12 @@ async function simulate(row) {
     if (oorRun >= 2) { trigger = r > 1 ? 'OOR-UP' : 'OOR-DOWN'; break; }
     if (decayRun >= 2) { trigger = 'FEE-DECAY'; break; }
   }
-  return { cls, pnl: +pnl.toFixed(2), trigger, edge: edgeV1(row), eb: RATES.EDGE_BASIS, gates: { sg: row.sg, ac: row.ac, org: row.org, path: row.path } };
+  return { cls, pnl: +pnl.toFixed(2), trigger, edge: conv.edge, eb: RATES.EDGE_BASIS, v: RATES.REPLAY_CACHE_VERSION, gates: { sg: row.sg, ac: row.ac, org: row.org, path: row.path } };
 }
 
-(async () => {
+async function main() {
+  const MAX = arg('max', 150), FRICTION = arg('friction', 0.4);
+  const backfill = !process.argv.includes('--no-backfill');
   // ingest the daemon's own log plus any extension exports (shadow-*.jsonl) dropped here
   const files = fs.readdirSync(DIR).filter((f) => f === 'shadow.jsonl' || (/^shadow-.*\.jsonl$/.test(f)));
   if (!files.length) { console.log('no shadow logs found — shadow.jsonl accrues while the daemon runs; export shadow-lens-*.jsonl from the Quant Lens options page.'); return; }
@@ -110,30 +109,33 @@ async function simulate(row) {
     }
   }
   console.log('sources: ' + files.join(', '));
+  // pool age for legacy rows that never logged it (created_at is immutable: fetched once, cached)
+  const resolver = createPoolCreatedResolver({ cacheFile: DIR + '/pool-created.json', enabled: backfill });
+  await resolver.resolve(rows.filter((r) => needsPoolAge(r, RATES.FEE_BASIS)).map((r) => r.pool));
+  const convOf = new Map(rows.map((r) => [rowKey(r), RATES.legacyRowToV1(r, resolver.createdAt(r.pool))]));
+  const edgeV1 = (row) => convOf.get(rowKey(row)).edge;
+  if (resolver.stats.fetched || resolver.stats.failed || resolver.stats.skipped) {
+    console.log(`pool-age backfill: ${resolver.stats.fetched} fetched, ${resolver.stats.cached} cached, ${resolver.stats.failed} failed${resolver.stats.skipped ? `, ${resolver.stats.skipped} skipped (--no-backfill)` : ''}`);
+  }
   const cache = fs.existsSync(DIR + '/replay-cache.json') ? JSON.parse(fs.readFileSync(DIR + '/replay-cache.json', 'utf8')) : {};
   let fetched = 0;
   for (const row of rows) {
     const key = row.t + ':' + row.pool;
     const horizon = (HORIZON_H[row.sig || 'IGNITION'] || 6) * 3600e3;
-    if (cache[key] || Date.now() - row.t < horizon + 1800e3) continue;
+    if (cachedResult(cache, row) || Date.now() - row.t < horizon + 1800e3) continue;
     if (fetched >= MAX) break;
-    cache[key] = await simulate(row);
+    cache[key] = await simulate(row, convOf.get(key));
     fetched++;
     await sleep(150);
   }
   fs.writeFileSync(DIR + '/replay-cache.json', JSON.stringify(cache));
-  const done = rows.map((r) => ({ row: r, res: cache[r.t + ':' + r.pool] }))
+  const done = rows.map((r) => ({ row: r, res: cachedResult(cache, r) }))
     .filter((x) => x.row.sig !== 'BID_ASK' && x.row.profile !== 'ACCUM' && x.res && !x.res.skip);
   const accumSkipped = rows.filter((r) => r.sig === 'BID_ASK' || r.profile === 'ACCUM').length;
-  console.log(`shadow log: ${rows.length} observations | replayed: ${Object.keys(cache).length} (${fetched} new this run) | usable: ${done.length}\n`);
+  console.log(`shadow log: ${rows.length} observations | replayed: ${rows.filter((r) => cachedResult(cache, r)).length} on the current basis (${fetched} new this run; older-basis entries are re-simulated up to --max per run) | usable: ${done.length}\n`);
   if (accumSkipped) console.log(`BID ASK/ACCUM skipped: ${accumSkipped} (hybrid inventory and exit model not implemented)\n`);
   if (!done.length) return;
-  {
-    const legacy = done.filter((x) => x.row.eb !== RATES.EDGE_BASIS);
-    const unknownAge = legacy.filter((x) => x.row.fb !== RATES.FEE_BASIS && !Number.isFinite(ageOf(x.row))).length;
-    console.log(`edge basis: ${RATES.EDGE_BASIS} (fr/(1.3*s^2/4W)) | ${done.length - legacy.length} native rows, ${legacy.length} legacy rows rescaled x${RATES.LEGACY_EDGE_TO_V1.toFixed(4)}`
-      + (unknownAge ? ` | ${unknownAge} legacy rows lack poolAgeH: if their pool was <1h old, fr/edge stay understated` : '') + '\n');
-  }
+  console.log(RATES.legacyBasisLine(RATES.legacyBasisSummary(done.map((x) => convOf.get(rowKey(x.row))))) + '\n');
 
   const BUCKETS = [[0, 0.5], [0.5, 1], [1, 1.5], [1.5, 2], [2, 3], [3, 99]];
   for (const cls of [...new Set(done.map((x) => x.res.cls))]) {
@@ -166,4 +168,7 @@ async function simulate(row) {
       (fp.length ? ` | ${fp.length} full IGNITION passes → mean ${m(fp).toFixed(2)}%` : ''));
     console.log('  (if near-misses ≈ passes, surge/accel gates are deleting opportunity; if far worse, they are saving you)');
   }
-})();
+}
+
+module.exports = { pnlPrice, simulate, cachedResult, rowKey };
+if (require.main === module) main().catch((e) => { console.error('ERR', e.message); process.exit(1); });

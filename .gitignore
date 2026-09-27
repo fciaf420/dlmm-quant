@@ -30,3 +30,6 @@ candle_evidence.json.tmp
 launchwatch.jsonl
 launch.log
 launchlab-cache.json
+
+# pool created_at backfill cache for legacy shadow rows (replay/launchlab)
+pool-created.json

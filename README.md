@@ -37,7 +37,9 @@ edge = (LP fee rate / σ)  ÷  (1.3 × σ / 4W)   =   LP fee rate ÷ (1.3 × exp
 - A uniform ±W band's delta falls linearly across 2W, so gamma = V/2W and E[IL] = ½·gamma·σ² = **σ²/4W** (the same answer as Uniswap-v3's narrow-range LVR). A DLMM bin simulation (uniform liquidity per bin, W=20%) fits IL ≈ 1.42·ln(p)² vs 1/(4w)=1.25 vs the old 1/(8w)=0.625, so σ²/4W is, if anything, still slightly generous.
 - Meteora's `fee_tvl_ratio` is **already net of the protocol cut**: on SOL-USDC with a 0.04% base fee, `fees/volume` = 0.0382% (below the minimum fee, so it cannot be gross) and `(fees + protocol_fees)/volume` = 0.0424%. Protocol share ≈ 10% standard / ≈20% on launch pools, already taken out.
 
-Thresholds were **not** retuned: `edge ≥ 1.0` now honestly means LP fees ≥ 1.3× modeled IL. On identical inputs every edge is 5/9 of what the pre-fix daemon printed, so entries need ~1.8× the fees. Shadow rows carry `eb: 'il4w-net-v1'`; `replay.cjs` rescales older rows by exactly 5/9 before bucketing so the two bases never mix.
+**One rule for any band:** in-range IL/day = **σ² / (2 × full width)**, full width = max − min in %. Two-sided ±W has full width 2W → σ²/4W (above). A **one-sided** band (0 → −W, e.g. IGNITION when OFI > 2) holds the same capital in half the width, so its in-range IL is σ²/2W: twice the gamma, **half the edge** on the same fees. Edge assumes capital earns the pool fee rate while active, so IL must be the in-range IL too (`rates.cjs` `ilPerDayForRange`; `gates.cjs` `edgeForTradeRange`).
+
+Thresholds were **not** retuned: `edge ≥ 1.0` now honestly means LP fees ≥ 1.3× modeled IL. On identical inputs every two-sided edge is 5/9 of what the pre-fix daemon printed (entries need ~1.8× the fees), and one-sided IGNITION edges are 5/18. Shadow rows carry `eb: 'il4w-net-v1'` (which includes the one-sided rule). `replay.cjs` and `launchlab.cjs` convert older rows through one shared helper (`rates.cjs` `legacyRowToV1`): ×5/9, ×0.5 more when the row's band was identifiably one-sided, and the pool-age fee fix when the pool's age at that row is known (logged, or backfilled once per pool from its immutable `created_at` into `pool-created.json`; `--no-backfill` for offline runs). Rows that can't be identified are counted in the summary line, never silently mixed.
 
 `edge ≥ 1.0` is the configured heuristic threshold. It is not a profit forecast. The model does not include exact bin shape, directional inventory, swap/priority fees, slippage, rewards, or position-specific fill path. BID ASK is an accumulation profile and does not use this symmetric TRADE proxy.
 
@@ -265,7 +267,7 @@ npm start                                # the daemon
 npm run screen                           # one-shot preview of the configured top candidate set
 npm test                                 # mock-only strategy/recovery regression tests
 node calibrate.cjs                       # per-class results from real trades
-node replay.cjs [--max 150]              # entry-gate calibration curves from shadow observations
+node replay.cjs [--max 150] [--no-backfill]  # entry-gate calibration curves from shadow observations
 node candle-analysis.cjs <POOL> [--json] # public completed-candle pullback evidence; no wallet/config
 node binscore.cjs <POOL> <VOL%/day>      # bin-crowding map — see where other LPs AREN'T
                                          # (fees are paid per-bin pro-rata: a thin bin in the
@@ -289,7 +291,8 @@ Scan lines, deploys, and exits all print a clickable `meteora.ag/dlmm/<pool>` li
 | `positions.json` | open-position registry (restart-proof) |
 | `trades.json` | closed round trips: class, entry context, exit trigger, PnL — the calibration dataset |
 | `shadow.jsonl` | every candidate evaluation, signal or not — the counterfactual dataset |
-| `replay-cache.json` | cached replay outcomes (a past outcome never changes) |
+| `replay-cache.json` | cached replay outcomes, stamped with the fee/edge basis they were simulated under; entries from an older basis are re-simulated (up to `--max` per run) |
+| `pool-created.json` | pool `created_at` backfill cache for legacy shadow rows (immutable, fetched once per pool) |
 | `daemon_state.json` | σ/fee history, cooldowns, OOR counters |
 | `candle_evidence.json` | bounded public OHLCV cache and latest descriptive BID ASK evidence |
 | `events.log` | every deploy/exit/failure, with the actual error text |

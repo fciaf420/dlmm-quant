@@ -27,11 +27,20 @@ function classifyPath({ pc5, pc1, dd, pos }) {
 // rates.cjs for the live proof and the bin simulation. edge = fr / (1.3 * IL).
 // Thresholds below are deliberately UNCHANGED: on identical inputs every edge is
 // now 5/9 of the old number, i.e. entries need ~1.8x the fees they used to.
+// widthPct here is the +-W HALF-width of a two-sided band. For a one-sided band pass
+// RATES.equivalentHalfWidth(depth, 'single') = depth/2 (same capital in half the width:
+// in-range IL sigma^2/(2*depth), see rates.cjs ilPerDayForRange) - or use edgeForRange.
 const edgeFrom = (fr, sigma, widthPct = 20) => {
   if (![fr, sigma, widthPct].every(Number.isFinite) || sigma <= 0 || widthPct <= 0) return 0;
   return ((fr * RATES.LP_FEE_SHARE) / Math.max(sigma, .001))
     / Math.max(RATES.EDGE_SAFETY * sigma / (RATES.IL_DENOM * widthPct), .001);
 };
+// the same heuristic for a band given by its FULL width (max - min, %)
+const edgeForRange = (fr, sigma, fullWidthPct) => edgeFrom(fr, sigma, fullWidthPct / 2);
+// edge for a tradeRange() result deployed in `mode`: effectiveWidthPct is the down
+// depth, which is the half-width of a two-sided band but the FULL width of a single one
+const edgeForTradeRange = (fr, sigma, range, mode) => (range
+  ? edgeFrom(fr, sigma, RATES.equivalentHalfWidth(range.effectiveWidthPct, mode)) : 0);
 
 const ignition = ({ edge, sg, ac, org, path, ageH, ofi }) =>
   [edge, sg, ac, org, ageH, ofi].every(finite)
@@ -225,16 +234,18 @@ function collectSignals({ data: d, config: c, now = Date.now() }) {
   const ignitionWanted = Math.min(30, Math.max(12, Math.round(d.sigma / 4)));
   const ignitionMode = d.ofi > 2 ? 'single' : 'two';
   const ignitionRange = makeRange(ignitionWanted, ignitionMode);
-  const ignitionEdge = edgeFrom(d.feeRate1h, d.sigma, ignitionRange && ignitionRange.effectiveWidthPct);
+  // ONE-SIDED IL (2026-09-27, mirror of meteora-quant-lens): when ofi > 2 IGNITION ships a
+  // quote-only 0 -> -W band - same capital in half the width of +-W, 2x in-range IL.
+  const ignitionEdge = edgeForTradeRange(d.feeRate1h, d.sigma, ignitionRange, ignitionMode);
   out.recipeEdges.IGNITION = ignitionEdge;
 
   const basingWanted = Math.min(30, Math.max(8, Math.round(rawW)));
   const basingRange = makeRange(basingWanted, 'two');
-  const basingEdge = edgeFrom(d.feeRate1h, d.sigma, basingRange && basingRange.effectiveWidthPct);
+  const basingEdge = edgeForTradeRange(d.feeRate1h, d.sigma, basingRange, 'two');
   out.recipeEdges.BASING = basingEdge;
 
   const carryRange = makeRange(35, 'two');
-  const carryEdge = edgeFrom(d.feeRate1h, d.sigma, carryRange && carryRange.effectiveWidthPct);
+  const carryEdge = edgeForTradeRange(d.feeRate1h, d.sigma, carryRange, 'two');
   out.recipeEdges.CARRY = carryEdge;
 
   const common = (label, mode, range, size, tp, sl, stop, wantedPct) => ({
@@ -379,7 +390,7 @@ function selectExecutionSignal(entries) {
 }
 
 module.exports = {
-  classifyPath, edgeFrom, ignition, basing, basingFloor, carry,
+  classifyPath, edgeFrom, edgeForRange, edgeForTradeRange, ignition, basing, basingFloor, carry,
   downsideRange, tradeRange, bidAskSignal, resolvePositionProfile,
   needsDeploymentResume, evaluateAccumLifecycle, signalsReady, updateFeeDecay, collectSignals,
   selectBidAskCandidates, selectBidAskHistoryCandidates, selectExecutionSignal,

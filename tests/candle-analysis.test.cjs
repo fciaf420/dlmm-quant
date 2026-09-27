@@ -457,3 +457,49 @@ test('standalone CLI rejects a pool that is not token-X and wrapped-SOL-Y before
   assert.equal(calls.length, 1);
   assert.match(errors.join('\n'), /token X.*wrapped SOL token Y/i);
 });
+
+test('a stale-history WAIT at the bucket boundary is retried after 20s, not cached for the bucket', async () => {
+  // Clock sits 5s into the bucket that starts at NOW_SEC. The just-closed candle
+  // (LAST_CLOSED) is not published yet on the first fetch -> WAIT stale-history.
+  let nowMs = NOW_SEC * 1000 + 5_000;
+  let published = false;
+  const calls = [];
+  const fetchJson = async (url) => {
+    calls.push(url);
+    const u = new URL(url);
+    const start = Number(u.searchParams.get('start_time'));
+    const end = Number(u.searchParams.get('end_time'));
+    const data = [];
+    for (let ts = start; ts <= end; ts += STEP) {
+      if (ts === LAST_CLOSED && !published) continue;
+      if (ts >= NOW_SEC) continue;
+      data.push(candle(ts));
+    }
+    return { data };
+  };
+  const loader = createCandleHistoryLoader({ fetchJson, nowMs: () => nowMs, maxPools: 2 });
+  const first = await loader.load('POOL');
+  assert.equal(first.analysis.state, 'WAIT');
+  assert.equal(first.analysis.reason, 'stale-history');
+  const afterFirst = calls.length;
+
+  // 10s later, same bucket: still inside the retry window -> served from cache
+  nowMs += 10_000;
+  published = true;
+  const cached = await loader.load('POOL');
+  assert.equal(cached.analysis.reason, 'stale-history');
+  assert.equal(calls.length, afterFirst);
+
+  // 21s after the first fetch, same bucket: the stale WAIT is refetched and clears
+  nowMs = NOW_SEC * 1000 + 5_000 + 21_000;
+  const retried = await loader.load('POOL');
+  assert.ok(calls.length > afterFirst, 'refetched');
+  assert.ok(['READY', 'LIMITED'].includes(retried.analysis.state), retried.analysis.state);
+  assert.equal(retried.analysis.latestCompletedTs, LAST_CLOSED);
+
+  // and a good result is cached for the rest of the bucket again
+  const afterRetry = calls.length;
+  nowMs += 60_000;
+  await loader.load('POOL');
+  assert.equal(calls.length, afterRetry);
+});

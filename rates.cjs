@@ -16,7 +16,11 @@
 // windows, and a fresh pool for an old token is exactly the case that broke.
 
 const FEE_BASIS = 'pool-age-v1';      // stamped on rows/baselines computed this way
-const EDGE_BASIS = 'il4w-net-v1';     // stamped on rows whose edge uses the formula below
+// stamped on rows whose edge uses the formula below. v1 INCLUDES the one-sided rule
+// (ilPerDayForRange): no row was ever written with this tag before that rule existed.
+const EDGE_BASIS = 'il4w-net-v1';
+// replay/launchlab cache entries simulated under any other basis are misses
+const REPLAY_CACHE_VERSION = FEE_BASIS + '|' + EDGE_BASIS;
 const MIN_FEE_HISTORY_H = 1;          // under 1h of fees nothing fee-priced may pass (launch hold)
 const MIN_COVERED_H = 0.25;           // floor so a minutes-old pool never divides by ~0
 
@@ -98,13 +102,90 @@ function legacyWindowRate(value, windowH, recordedAtMs, poolCreatedAt, basis) {
   return v * windowH / coveredHours(windowH, ageAt);
 }
 
-// expected IL %/day of a +-W uniform band, and the LP fee %/day that breaks even on it
-const ilPerDay = (sigma, widthPct) => (sigma * sigma) / (IL_DENOM * widthPct);
-const breakevenFeePerDay = (sigma, widthPct) => ilPerDay(sigma, widthPct) / LP_FEE_SHARE;
+// ONE RULE FOR ANY UNIFORM BAND: in-range IL %/day = sigma^2 / (2 * fullWidthPct),
+// fullWidthPct = max - min of the band in %. The edge heuristic assumes capital earns
+// the pool fee rate while ACTIVE, so IL must be the in-range IL too. A one-sided band
+// (0 -> -W, or 0 -> +W) holds the same capital in half the width of a +-W band: twice
+// the gamma, twice the IL. Two-sided +-W: full 2W -> sigma^2/(4W) (unchanged).
+// One-sided 0 -> -W: full W -> sigma^2/(2W). (mirror of meteora-quant-lens)
+const ilPerDayForRange = (sigma, fullWidthPct) => (sigma * sigma) / (2 * fullWidthPct);
+// two-sided +-W alias (the historical call shape): = ilPerDayForRange(sigma, 2W)
+const ilPerDay = (sigma, halfWidthPct) => ilPerDayForRange(sigma, 2 * halfWidthPct);
+// the +-W half-width whose sigma^2/(4W) equals a band's in-range IL: two-sided keeps W,
+// a one-sided band of depth D is equivalent to +-(D/2)
+const equivalentHalfWidth = (widthPct, mode = 'two') => (mode === 'single' ? widthPct / 2 : widthPct);
+const breakevenFeePerDayForRange = (sigma, fullWidthPct) => ilPerDayForRange(sigma, fullWidthPct) / LP_FEE_SHARE;
+const breakevenFeePerDay = (sigma, halfWidthPct) => breakevenFeePerDayForRange(sigma, 2 * halfWidthPct);
+
+// ---- legacy shadow-row conversion (ONE copy, shared by replay.cjs + launchlab.cjs) --
+// Rows without `eb` were logged with edge = fr*0.9/(1.3*s^2/(8W)), W = the recipe's
+// deployed depth for BOTH modes, and fr = ratio1h*24 regardless of pool age.
+// Conversion to v1: edge x5/9 always; x0.5 more when the row's edge was a one-sided
+// band; fr (and edge) x 1/max(age,0.25h) when the pool was under 1h old at the row.
+
+// Pool age at the row's own timestamp: logged poolAgeH (daemon/launchwatch), pAgeH
+// (Quant Lens exports), else a backfilled pool created_at (pool_created.cjs).
+function rowPoolAgeH(row, createdAt) {
+  if (finite(row && row.poolAgeH)) return row.poolAgeH;
+  if (finite(row && row.pAgeH)) return row.pAgeH;
+  if (createdAt != null && finite(row && row.t)) return poolAgeHours(createdAt, row.t);
+  return null;
+}
+
+// true / false / null (cannot tell). Daemon rows (they carry recipeEdges/edgeModel) log
+// the trade's edge when one fired (BASING/CARRY: two-sided) and otherwise the IGNITION
+// recipe edge, whose band was one-sided exactly when ofi > 2 (gates.cjs). Quant Lens
+// rows' legacy edge was always a two-sided +-W computation.
+function legacyEdgeOneSided(row) {
+  if (!row) return null;
+  if (row.mode === 'single') return true;
+  if (row.mode === 'two') return false;
+  const daemonRow = row.recipeEdges != null || row.edgeModel != null;
+  if (!daemonRow) return false;
+  if (row.sig && row.sig !== 'IGNITION') return false;
+  if (!finite(row.ofi)) return null;
+  return row.ofi > 2;   // NB: logged ofi is rounded to 2dp; 2.001-2.004 reads as 2.00
+}
+
+function legacyRowToV1(row, createdAt) {
+  const ageH = rowPoolAgeH(row, createdAt);
+  const legacyFee = row.fb !== FEE_BASIS;
+  const feeFix = (legacyFee && ageH != null && ageH < 1) ? 1 / Math.max(ageH, MIN_COVERED_H) : 1;
+  const fr = finite(row.fr) ? row.fr * feeFix : row.fr;
+  const feeAgeKnown = !legacyFee || ageH != null;
+  if (row.eb === EDGE_BASIS) return { edge: row.edge, fr, native: true, oneSided: null, feeAgeKnown, ageH };
+  const oneSided = legacyEdgeOneSided(row);
+  const edge = finite(row.edge)
+    ? row.edge * LEGACY_EDGE_TO_V1 * feeFix * (oneSided === true ? 0.5 : 1) : row.edge;
+  return { edge, fr, native: false, oneSided, feeAgeKnown, ageH };
+}
+
+const replayCacheHit = (entry) => !!entry && entry.v === REPLAY_CACHE_VERSION;
+
+// basis bookkeeping for the replay/launchlab summary line (one copy: no drift)
+function legacyBasisSummary(convs) {
+  const out = { native: 0, legacy: 0, oneSided: 0, sideUnknown: 0, ageUnknown: 0 };
+  for (const c of convs) {
+    if (c.native) { out.native++; continue; }
+    out.legacy++;
+    if (c.oneSided === true) out.oneSided++;
+    if (c.oneSided === null) out.sideUnknown++;
+    if (!c.feeAgeKnown) out.ageUnknown++;
+  }
+  return out;
+}
+function legacyBasisLine(b) {
+  return `edge basis: ${EDGE_BASIS} (fr/(1.3*s^2/2F), F = full band width) | ${b.native} native, ${b.legacy} legacy rows x${LEGACY_EDGE_TO_V1.toFixed(4)}`
+    + (b.oneSided ? ` (${b.oneSided} one-sided: extra x0.5)` : '')
+    + (b.sideUnknown ? ` | ${b.sideUnknown} legacy rows: band side unidentifiable (no ofi) -> left at x5/9, one-sided ones still overstated 2x` : '')
+    + (b.ageUnknown ? ` | ${b.ageUnknown} legacy rows: pool age unknown -> if <1h old, fr/edge stay understated` : '');
+}
 
 module.exports = {
   FEE_BASIS, EDGE_BASIS, MIN_FEE_HISTORY_H, MIN_COVERED_H, LP_FEE_SHARE, IL_DENOM,
-  EDGE_SAFETY, LEGACY_EDGE_TO_V1,
+  EDGE_SAFETY, LEGACY_EDGE_TO_V1, REPLAY_CACHE_VERSION,
   poolAgeHours, coveredHours, windowPerDay, accelFrom, poolAgeStage, launchHeld,
-  legacyWindowRate, ilPerDay, breakevenFeePerDay,
+  legacyWindowRate, ilPerDay, ilPerDayForRange, equivalentHalfWidth,
+  breakevenFeePerDay, breakevenFeePerDayForRange,
+  rowPoolAgeH, legacyEdgeOneSided, legacyRowToV1, replayCacheHit, legacyBasisSummary, legacyBasisLine,
 };
